@@ -1,0 +1,56 @@
+# Nix
+/result
+/result-*
+/nix/result
+.direnv/
+.envrc.local
+
+# Python & uv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.python-version
+
+# ROS 2
+install/
+build/
+devel/
+log/
+*.bag
+*.mcap
+/ros2_ws/
+*.rosbag2
+/.ros/
+
+# Virtual environments & caches
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs & temporary files
+*.log
+*.bak
+*.tmp
+
+# Environment variables
+.env
+.env.local
+.env.*.local

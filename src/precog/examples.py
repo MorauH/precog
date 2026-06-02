@@ -3,20 +3,20 @@ Usage examples for the multi-rate hierarchical PC world model.
 """
 
 import torch
-from model.model import HierarchicalPCWorldModel
-from model.hierarchical_clock import ClockConfig, HierarchicalClock
+from precog.model import ClockConfig, HierarchicalClock, HierarchicalPCWorldModel
 
 
 # -----------------------------------------------------------------------
 # 1. Real-time robot control at 100 / 10 / 1 Hz
 # -----------------------------------------------------------------------
 
+
 def example_realtime_control(model: HierarchicalPCWorldModel, env):
     """Standard online control loop with real-time pacing."""
 
     runner = model.build_runner(
-        level_frequencies=[100, 10, 1],   # Hz per level (index 0 = fastest)
-        time_scale=1.0,                   # real-time
+        level_frequencies=[100, 10, 1],  # Hz per level (index 0 = fastest)
+        time_scale=1.0,  # real-time
         batch_size=1,
         device="cpu",
     )
@@ -43,12 +43,13 @@ def example_realtime_control(model: HierarchicalPCWorldModel, env):
 # 2. Fast simulation (10× faster than real-time)
 # -----------------------------------------------------------------------
 
+
 def example_fast_simulation(model: HierarchicalPCWorldModel, sim_env):
     """Run at 10× speed — sleep durations are 10× shorter."""
 
     runner = model.build_runner(
         level_frequencies=[100, 10, 1],
-        time_scale=10.0,        # ← the only change
+        time_scale=10.0,  # ← the only change
         batch_size=1,
         device="cuda",
     )
@@ -58,19 +59,20 @@ def example_fast_simulation(model: HierarchicalPCWorldModel, sim_env):
     for _ in range(100_000):
         result = runner.tick(obs, prev_action)
         obs, prev_action = sim_env.step(result.action)
-        runner.clock.sleep_until_next_tick()   # sleeps 10× less
+        runner.clock.sleep_until_next_tick()  # sleeps 10× less
 
 
 # -----------------------------------------------------------------------
 # 3. Maximum-speed rollout (no pacing — as fast as hardware allows)
 # -----------------------------------------------------------------------
 
+
 def example_max_speed_rollout(model: HierarchicalPCWorldModel, sim_env):
     """Collect a rollout as fast as possible — skip sleep entirely."""
 
     runner = model.build_runner(
         level_frequencies=[100, 10, 1],
-        time_scale=1.0,    # doesn't matter when not sleeping
+        time_scale=1.0,  # doesn't matter when not sleeping
         batch_size=1,
         device="cuda",
     )
@@ -80,11 +82,15 @@ def example_max_speed_rollout(model: HierarchicalPCWorldModel, sim_env):
 
     for _ in range(10_000):
         result = runner.tick(obs, prev_action)
-        trajectory.append({
-            "action":    result.action.cpu(),
-            "surprise":  result.total_surprise.item() if result.total_surprise else 0,
-            "sim_time":  result.sim_time,
-        })
+        trajectory.append(
+            {
+                "action": result.action.cpu(),
+                "surprise": result.total_surprise.item()
+                if result.total_surprise
+                else 0,
+                "sim_time": result.sim_time,
+            }
+        )
         obs, prev_action = sim_env.step(result.action)
         # No sleep — run as fast as possible
 
@@ -95,12 +101,13 @@ def example_max_speed_rollout(model: HierarchicalPCWorldModel, sim_env):
 # 4. Change simulation speed mid-episode
 # -----------------------------------------------------------------------
 
+
 def example_dynamic_time_scale(model: HierarchicalPCWorldModel, sim_env):
     """Slow down near interesting events, speed up during boring stretches."""
 
     runner = model.build_runner(
         level_frequencies=[100, 10, 1],
-        time_scale=10.0,   # start fast
+        time_scale=10.0,  # start fast
     )
 
     obs, prev_action = sim_env.reset()
@@ -121,6 +128,7 @@ def example_dynamic_time_scale(model: HierarchicalPCWorldModel, sim_env):
 # -----------------------------------------------------------------------
 # 5. Introspect which levels fired
 # -----------------------------------------------------------------------
+
 
 def example_inspect_updates(model: HierarchicalPCWorldModel, env):
     """Show per-level update patterns and prediction errors."""
@@ -157,6 +165,7 @@ def example_inspect_updates(model: HierarchicalPCWorldModel, env):
 # 6. Training (full-sequence, no rate scheduling)
 # -----------------------------------------------------------------------
 
+
 def example_training(model: HierarchicalPCWorldModel, dataloader, optimizer):
     """Training uses the regular forward() — no runner needed."""
 
@@ -165,8 +174,8 @@ def example_training(model: HierarchicalPCWorldModel, dataloader, optimizer):
     hidden_target = None
 
     for batch in dataloader:
-        obs_dict = batch["obs"]           # (B, T, d_sensor)
-        actions_gt = batch["actions"]     # (B, T, d_action)
+        obs_dict = batch["obs"]  # (B, T, d_sensor)
+        actions_gt = batch["actions"]  # (B, T, d_action)
 
         out = model.forward(
             obs_dict,
@@ -177,7 +186,7 @@ def example_training(model: HierarchicalPCWorldModel, dataloader, optimizer):
         )
 
         # Chain hidden states across chunks (TBPTT)
-        hidden        = [h.detach() for h in out["hidden_states"]]
+        hidden = [h.detach() for h in out["hidden_states"]]
         hidden_target = [h.detach() for h in out["hidden_states_target"]]
 
         # Losses
@@ -195,6 +204,7 @@ def example_training(model: HierarchicalPCWorldModel, dataloader, optimizer):
 # 7. Episode reset
 # -----------------------------------------------------------------------
 
+
 def example_episode_reset(model: HierarchicalPCWorldModel, env):
     runner = model.build_runner(
         level_frequencies=[100, 10, 1],
@@ -202,7 +212,7 @@ def example_episode_reset(model: HierarchicalPCWorldModel, env):
     )
 
     for episode in range(10):
-        runner.reset()                        # ← zeros hidden states + clock
+        runner.reset()  # ← zeros hidden states + clock
         obs, prev_action = env.reset()
 
         for _ in range(1000):
@@ -217,10 +227,9 @@ def example_episode_reset(model: HierarchicalPCWorldModel, env):
 # 8. Clock standalone (use without a runner)
 # -----------------------------------------------------------------------
 
+
 def example_clock_standalone():
     """The clock can be used independently for any multi-rate scheduling."""
-
-    from hierarchical_clock import ClockConfig, HierarchicalClock
 
     cfg = ClockConfig(level_frequencies=[100, 10, 1], time_scale=1.0)
     clock = HierarchicalClock(cfg)

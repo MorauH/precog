@@ -34,13 +34,15 @@ Level communication at different rates
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
 from .hierarchical_clock import ClockConfig, HierarchicalClock
 from .level_state import LevelState
-from .model import HierarchicalPCWorldModel
+
+if TYPE_CHECKING:
+    from .model import HierarchicalPCWorldModel
 
 
 @dataclass
@@ -64,6 +66,7 @@ class RunnerConfig:
         If False, only the most recent level-i output is used (simpler but
         loses within-window dynamics at higher levels).
     """
+
     level_frequencies: List[float]
     time_scale: float = 1.0
     batch_size: int = 1
@@ -88,6 +91,7 @@ class TickResult:
     total_surprise:
         Sum of squared prediction errors across all levels that fired.
     """
+
     action: torch.Tensor
     level_states: List[LevelState]
     updated_levels: List[int]
@@ -242,16 +246,16 @@ class MultiRateRunner:
         ctrl_idx = self.model.control_level_idx
         ctrl_state = self._level_states[ctrl_idx]
 
-        z_ctrl = ctrl_state.last_z.unsqueeze(1)         # (B, 1, d_repr)
+        z_ctrl = ctrl_state.last_z.unsqueeze(1)  # (B, 1, d_repr)
         z_hat_ctrl = ctrl_state.last_z_hat_next.unsqueeze(1)  # (B, 1, d_repr)
 
-        action = self.model.control_head(
-            torch.cat([z_ctrl, z_hat_ctrl], dim=-1)
-        )[:, -1]  # (B, action_dim)
+        action = self.model.control_head(torch.cat([z_ctrl, z_hat_ctrl], dim=-1))[
+            :, -1
+        ]  # (B, action_dim)
 
         return TickResult(
             action=action,
-            level_states=list(self._level_states),   # snapshot (refs, not copies)
+            level_states=list(self._level_states),  # snapshot (refs, not copies)
             updated_levels=updated_levels,
             sim_time=sim_time,
             total_surprise=total_surprise,
@@ -302,12 +306,12 @@ class MultiRateRunner:
         """Run modality encoders and concatenate. Returns (B, d_level0)."""
         encoded = []
         for name, encoder in self.model.modality_encoders.items():
-            x = obs_dict[name]                      # (B, sensor_dim)
+            x = obs_dict[name]  # (B, sensor_dim)
             if name == "control" and prev_action is not None:
                 x = prev_action
-            z0 = encoder(x.unsqueeze(1))            # encoder expects (B, T, d)
-            encoded.append(z0[:, -1])               # (B, d_out)
-        return torch.cat(encoded, dim=-1)           # (B, d_level0)
+            z0 = encoder(x.unsqueeze(1))  # encoder expects (B, T, d)
+            encoded.append(z0[:, -1])  # (B, d_out)
+        return torch.cat(encoded, dim=-1)  # (B, d_level0)
 
     def _pop_sequence_for_level(
         self, level_idx: int, fallback_z: torch.Tensor

@@ -29,9 +29,32 @@
         ros = pkgs.rosPackages.jazzy;
       in
       {
+        packages.default = pkgs.writeShellApplication {
+          name = "precog";
+          runtimeInputs = [ pkgs.uv pkgs.rosPackages.jazzy.python ];
+
+          text = ''
+            if [ -n "''${FORCE_CPU:-}" ]; then
+              UV_EXTRA="cpu"
+            elif command -v nvidia-smi >/dev/null 2>&1 || [ -c /dev/nvidia0 ]; then
+              UV_EXTRA="cuda"
+            else
+              UV_EXTRA="cpu"
+            fi
+
+            exec uv run --extra "$UV_EXTRA" --python ${pkgs.rosPackages.jazzy.python}/bin/python3 precog "$@"
+          '';
+        };
+
+        apps.default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/precog";
+        };
+
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            pkgs.python312
+            self.packages.${system}.default
+            pkgs.rosPackages.jazzy.python
             pkgs.uv
 
             # ROS 2 Core
@@ -62,27 +85,34 @@
             pkgs.stdenv.cc.cc.lib
             pkgs.zlib
           ]}:/usr/lib/wsl/lib";
-
+        
           shellHook = ''
             export PATH="/usr/lib/wsl/lib:$PATH"
-            echo "Python ML + MCAP Replayer environment loaded"
-            echo "Usage:"
-            echo "   ros2 bag play recording.mcap --rate 2.0 --loop"
-            echo "   ros2 bag play recording.mcap --topics /imu /odom"
-            echo ""            
-            
-            if [ ! -d .venv ]; then
-              echo "Creating virtual environment..."
-              uv venv .venv --python python3
+
+            # Dynamically detect hardware capability
+            if [ -n "$FORCE_CPU" ]; then
+              UV_EXTRA="cpu"
+              echo "Force-CPU mode explicitly requested."
+            elif command -v nvidia-smi &> /dev/null || [ -c /dev/nvidia0 ]; then
+              UV_EXTRA="cuda"
+              echo "NVIDIA Hardware detected. Provisioning CUDA environment..."
+            else
+              UV_EXTRA="cpu"
+              echo "No NVIDIA GPU detected. Provisioning CPU-only environment..."
             fi
 
+            precog() {
+              uv run --extra "$UV_EXTRA" --python ${pkgs.rosPackages.jazzy.python}/bin/python3 precog "$@"
+            }
+            
+            echo "Synchronizing virtual environment via uv..."
+            uv sync --extra "$UV_EXTRA" --python ${pkgs.rosPackages.jazzy.python}/bin/python3
+            
             source .venv/bin/activate
 
-            if ! python -c "import mcap" 2>/dev/null; then
-              uv pip install mcap mcap-ros2-support
-            fi
-
-            echo "Ready: torch, mcap-replayer, etc."
+            echo "Environment ready. Verification:"
+            python -c "import torch; print('  CUDA Available:', torch.cuda.is_available())"
+            echo "   ros2 bag play recording.mcap --rate 2.0 --loop"
           '';
         };
       }

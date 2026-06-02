@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "precog"
+version = "0.1.0"
+requires-python = ">=3.13"
+scripts = { precog = "precog.main:main" }
+dependencies = [
+    "numpy",
+    "mcap",
+    "mcap-ros2-support",
+]
+
+# Define hardware targets as extras
+[project.optional-dependencies]
+cpu = ["torch"]
+cuda = ["torch"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]
+
+# Register the explicit mirrors
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+# Route the torch package to the correct mirror based on the active extra
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cuda", extra = "cuda" },
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

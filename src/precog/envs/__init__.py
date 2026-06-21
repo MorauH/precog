@@ -1,1 +1,1 @@
-from precog.envs.ros import ROSEnvironment
+from .ros.ros import ROSEnvironment

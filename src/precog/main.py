@@ -11,7 +11,7 @@ def main():
     # 1. Initialize environment and model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    env = ROSEnvironment(device=device)
+    env = ROSEnvironment(config_path="./src/precog/envs/ros/env_config.yaml", device=device)
 
     model = HierarchicalPCWorldModel(DEFAULT_CONFIG).to(device)
 
@@ -19,7 +19,7 @@ def main():
         level_frequencies=[100, 10, 1],  # Hz per level (index 0 = fastest)
         time_scale=1.0,
         batch_size=1,
-        device="cpu",
+        device=device,
     )
 
     # 2. Run standard control loop pattern

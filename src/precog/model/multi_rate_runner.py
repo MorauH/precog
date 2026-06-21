@@ -286,7 +286,7 @@ class MultiRateRunner:
         states = []
         for i, level in enumerate(self.model.levels):
             d_state = level.ssm.d_state
-            d_repr = level.repr_dim
+            d_repr = level.d_repr
             states.append(
                 LevelState.init(
                     level_idx=i,

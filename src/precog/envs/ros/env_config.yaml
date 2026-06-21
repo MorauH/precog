@@ -1,0 +1,45 @@
+# env_config.yaml
+
+qos_default:
+  reliability: best_effort   # or "reliable"
+  history_depth: 10
+
+observations:
+  - key: position
+    topic: /robot/position
+    msg_type: geometry_msgs/msg/Point
+    codec: point_xyz
+    shape: [3]
+    max_age_sec: 0.5
+    required: true
+
+  - key: orientation
+    topic: /robot/orientation
+    msg_type: geometry_msgs/msg/Quaternion
+    codec: quaternion_xyzw
+    shape: [4]
+    max_age_sec: 0.5
+    required: true
+
+  - key: imu
+    topic: /robot/imu
+    msg_type: sensor_msgs/msg/Imu
+    codec: imu
+    shape: [6]
+    max_age_sec: 0.2
+    required: false
+
+  # Adding a new sensor is just another block like this one, e.g.:
+  # - key: lidar
+  #   topic: /robot/lidar/points
+  #   msg_type: sensor_msgs/msg/PointCloud2
+  #   codec: pointcloud_xyz
+  #   shape: [null, 3]
+  #   max_age_sec: 0.2
+  #   required: false
+
+actions:
+  - key: throttle
+    topic: /robot/throttle
+    msg_type: std_msgs/msg/Float32MultiArray
+    codec: float_array

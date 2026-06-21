@@ -111,7 +111,6 @@ class ModelConfig:
 
 # ---------------------------------------------------------------------------
 # Default config
-# Sized for a Jetson-class embedded computer and a few hours of driving logs.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG = ModelConfig(

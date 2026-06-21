@@ -69,14 +69,9 @@ class HierarchicalPCWorldModel(nn.Module):
         for i, level_cfg in enumerate(config.level_configs):
             self.levels.append(
                 PCLevel(
-                    input_dim=prev_dim,
-                    repr_dim=level_cfg.d_representation,
-                    state_dim=level_cfg.ssm.d_state,
-                    prediction_head_hidden=level_cfg.prediction_head_hidden,
-                    forward_head_hidden=level_cfg.forward_head_hidden,
-                    dt_min=level_cfg.ssm.dt_min,
-                    dt_max=level_cfg.ssm.dt_max,
-                    name=f"level{i + 1}",
+                    d_below=prev_dim,
+                    d_above= None if i == len(self.config.level_configs) else level_cfg.d_representation,
+                    config=level_cfg
                 )
             )
             prev_dim = level_cfg.d_representation

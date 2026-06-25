@@ -20,7 +20,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rosidl_runtime_py.utilities import get_message
 
-from .codecs import OBS_CODECS, ACTION_CODECS
+from .codecs import OBS_CODECS, ACTION_CODECS, TRANSFORMS
 
 
 @dataclass
@@ -95,6 +95,15 @@ class ROSEnvironment(Node):
             self._action_publishers[spec.key] = self.create_publisher(msg_cls, spec.topic, qos)
             self.get_logger().info(f"Publishing: '{spec.key}' -> {spec.topic} ({spec.msg_type})")
 
+        # --- Resolve transforms ---
+        transform_names = cfg.get("transforms", [])
+        self._transforms = []
+        for name in transform_names:
+            if name not in TRANSFORMS:
+                raise ValueError(f"No transform registered for '{name}'")
+            self._transforms.append(TRANSFORMS[name])
+            self.get_logger().info(f"Transform: '{name}'")
+
         self._spin_executor = SingleThreadedExecutor()
         self._spin_executor.add_node(self)
         self._bg_thread = threading.Thread(target=self._spin_executor.spin, daemon=True)
@@ -137,6 +146,8 @@ class ROSEnvironment(Node):
                     out[spec.key] = None
                 else:
                     out[spec.key] = torch.as_tensor(value, device=self.device).unsqueeze(0)
+        for fn in self._transforms:
+            out = fn(out)
         return out
 
     def step(self, actions: dict[str, np.ndarray]) -> dict[str, Optional[torch.Tensor]]:

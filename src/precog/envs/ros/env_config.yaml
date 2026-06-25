@@ -5,41 +5,118 @@ qos_default:
   history_depth: 10
 
 observations:
-  - key: position
-    topic: /robot/position
-    msg_type: geometry_msgs/msg/Point
-    codec: point_xyz
-    shape: [3]
-    max_age_sec: 0.5
-    required: true
 
-  - key: orientation
-    topic: /robot/orientation
-    msg_type: geometry_msgs/msg/Quaternion
-    codec: quaternion_xyzw
-    shape: [4]
-    max_age_sec: 0.5
-    required: true
-
-  - key: imu
-    topic: /robot/imu
-    msg_type: sensor_msgs/msg/Imu
-    codec: imu
-    shape: [6]
+  - key: current_steering
+    topic: /steering_angle
+    msg_type: std_msgs/msg/Float32
+    codec: float
+    shape: [1, 1]
     max_age_sec: 0.2
-    required: false
+    required: true
 
-  # Adding a new sensor is just another block like this one, e.g.:
-  # - key: lidar
-  #   topic: /robot/lidar/points
-  #   msg_type: sensor_msgs/msg/PointCloud2
-  #   codec: pointcloud_xyz
-  #   shape: [null, 3]
-  #   max_age_sec: 0.2
-  #   required: false
+  - key: best_path
+    topic: /pathp/best_path
+    msg_type: nav_msgs/msg/Path
+    codec: path
+    shape: [1, -1, 2]
+    max_age_sec: 0.2
+    required: true
+
+  #- key: car_state
+  #  topic: /ekf/car_state #/sim?
+  #  msg_type: cfs_msgs/msg/StateEstimation
+  #  codec: car_state
+  #  shape: [1, 13]
+  #  max_age_sec: 0.1
+  #  required: true
+
+  - key: car_pose
+    topic: /graphslam/pose
+    msg_type: geometry_msgs/msg/Pose
+    codec: pose
+    shape: [-1]
+    max_age_sec: 0.1
+    required: true
+
+  #- key: wheel_speed_fl
+  #  topic: /ekf/wheel_speed_fl
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.2
+  #  required: true
+  #
+  #- key: wheel_speed_fr
+  #  topic: /ekf/wheel_speed_fr
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.2
+  #  required: true
+  #
+  #- key: wheel_speed_rl
+  #  topic: /ekf/wheel_speed_rl
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.2
+  #  required: true
+  #
+  #- key: wheel_speed_rr
+  #  topic: /ekf/wheel_speed_rr
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.2
+  #  required: true
+
+  #- key: slip_ratio_fl
+  #  topic: /ekf/slip_ratio_fl
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.2
+  #  required: true
+
+  #- key: slip_ratio_fr
+  #  topic: /ekf/slip_ratio_fr
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.2
+  #  required: true
+
+  #- key: slip_ratio_rl
+  #  topic: /ekf/slip_ratio_rl
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.2
+  #  required: true
+
+  #- key: slip_ratio_rr
+  #  topic: /ekf/slip_ratio_rr
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.2
+  #  required: true
+
+
+# Transforms run after all observations are decoded but before the snapshot
+# is returned.  They have access to all keys simultaneously - use this
+# when a feature depends on data from multiple topics.
+#
+transforms:
+  - best_path_relative_sampling 
 
 actions:
-  - key: throttle
-    topic: /robot/throttle
-    msg_type: std_msgs/msg/Float32MultiArray
-    codec: float_array
+  - key: steering 
+    topic: /cmd/steer
+    msg_type: std_msgs/msg/Float32
+    codec: float
+
+  - key: acceleration
+    topic: /cmd/acc
+    msg_type: std_msgs/msg/Float32
+    codec: float

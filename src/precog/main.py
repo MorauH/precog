@@ -23,7 +23,7 @@ def main():
     )
 
     # 2. Run standard control loop pattern
-    obs, prev_action = env.reset()
+    obs = env.reset()
 
     try:
         while rclpy.ok():

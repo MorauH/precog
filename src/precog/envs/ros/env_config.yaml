@@ -1,7 +1,19 @@
 # env_config.yaml
+#
+# Declares what ROS topics are available, how to decode them, and what
+# post-decode transforms to apply.
+#
+# shape convention
+# ~~~~~~~~~~~~~~~~
+#   shape: [batch_dim, ...features...]
+#
+#   The last element (shape[-1]) is the *input_dim* that any model
+#   modality encoder consuming this key should expect.  A value of -1 in
+#   any intermediate dimension means the size varies per message
+#   (e.g. variable-length waypoint arrays).
 
 qos_default:
-  reliability: best_effort   # or "reliable"
+  reliability: best_effort
   history_depth: 10
 
 observations:
@@ -34,7 +46,7 @@ observations:
     topic: /graphslam/pose
     msg_type: geometry_msgs/msg/Pose
     codec: pose
-    shape: [-1]
+    shape: [1, 6]
     max_age_sec: 0.1
     required: true
 
@@ -108,10 +120,16 @@ observations:
 # when a feature depends on data from multiple topics.
 #
 transforms:
-  - best_path_relative_sampling 
+  - best_path_relative_sampling
+
+# Keys that transforms add to the snapshot, with their output shapes.
+# Used by the model-config resolution layer to derive modality input_dim.
+transform_output_keys:
+  best_path_relative_sampling:
+    shape: [1, 9, 2]
 
 actions:
-  - key: steering 
+  - key: steering
     topic: /cmd/steer
     msg_type: std_msgs/msg/Float32
     codec: float

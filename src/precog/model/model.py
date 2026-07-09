@@ -48,14 +48,20 @@ class HierarchicalPCWorldModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        assert config.is_resolved, (
+            "ModelConfig modalities must have resolved input_dim. "
+            "Call resolve_config_dims() before constructing the model."
+        )
 
         # ---------------------------------------------------------------- #
         # Level 0: Modality-specific encoders
         # ---------------------------------------------------------------- #
         self.modality_encoders: nn.ModuleDict = nn.ModuleDict()
         for mod in config.modalities:
+            input_dim = mod.input_dim
+            assert input_dim is not None
             self.modality_encoders[mod.name] = ModalityEncoder(
-                input_dim=mod.input_dim,
+                input_dim=input_dim,
                 output_dim=mod.output_dim,
                 hidden_dim=getattr(mod, "hidden_dims", None),
             )
@@ -70,8 +76,10 @@ class HierarchicalPCWorldModel(nn.Module):
             self.levels.append(
                 PCLevel(
                     d_below=prev_dim,
-                    d_above= None if i == len(self.config.level_configs) else level_cfg.d_representation,
-                    config=level_cfg
+                    d_above=None
+                    if i == len(self.config.level_configs)
+                    else level_cfg.d_representation,
+                    config=level_cfg,
                 )
             )
             prev_dim = level_cfg.d_representation
@@ -126,9 +134,7 @@ class HierarchicalPCWorldModel(nn.Module):
 
         # Initialise hidden states if not provided
         if hidden_states is None:
-            hidden_states = [
-                level.init_hidden(batch)[0] for level in self.levels
-            ]
+            hidden_states = [level.init_hidden(batch)[0] for level in self.levels]
         if hidden_states_target is None:
             hidden_states_target = [
                 level.init_hidden(batch)[1] for level in self.levels
@@ -139,11 +145,7 @@ class HierarchicalPCWorldModel(nn.Module):
         for name, encoder in self.modality_encoders.items():
             x = obs_dict[name]
             if name == "control" and prev_action is not None:
-                x = (
-                    prev_action.unsqueeze(1)
-                    if prev_action.dim() == 2
-                    else prev_action
-                )
+                x = prev_action.unsqueeze(1) if prev_action.dim() == 2 else prev_action
             level0_list.append(encoder(x))
 
         z_level = torch.cat(level0_list, dim=-1)  # (B, T, d_level0)

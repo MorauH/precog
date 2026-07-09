@@ -50,18 +50,15 @@ def _float(msg) -> np.ndarray:
 def _point_xyz(msg) -> np.ndarray:
     return np.array([msg.x, msg.y, msg.z], dtype=np.float32)
 
-
 @obs_codec("quaternion_xyzw")
 def _quat_xyzw(msg) -> np.ndarray:
     return np.array([msg.x, msg.y, msg.z, msg.w], dtype=np.float32)
-
 
 @obs_codec("imu")
 def _imu(msg) -> np.ndarray:
     a = msg.linear_acceleration
     g = msg.angular_velocity
     return np.array([a.x, a.y, a.z, g.x, g.y, g.z], dtype=np.float32)
-
 
 @obs_codec("float_array")
 def _float_array(msg) -> np.ndarray:

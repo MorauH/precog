@@ -6,11 +6,6 @@ import torch.nn as nn
 
 class FNN(nn.Module):
     """
-    Feedforward network used as:
-      - prediction heads between PC levels  (top-down generative)
-      - forward prediction heads            (anticipatory, one step ahead)
-      - internal projections in the control head
-
     Uses LayerNorm + GELU activations for training stability, which matters
     particularly in the online learning setting where gradient updates are
     frequent and potentially noisy.

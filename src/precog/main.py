@@ -4,7 +4,6 @@ import termios
 import tty
 import threading
 import queue
-import time
 from enum import Enum, auto
 from typing import Optional
 
@@ -16,6 +15,7 @@ import yaml
 from precog.envs import ROSEnvironment
 from precog.model import DEFAULT_CONFIG, HierarchicalPCWorldModel
 from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
+from precog.model.diagnostics import DiagnosticsCollector, DiagnosticsConfig
 
 
 ENV_CONFIG_PATH = "./src/precog/envs/ros/env_config.yaml"
@@ -102,8 +102,17 @@ def main():
     action_keys = [s.key for s in env.action_specs]
     model = HierarchicalPCWorldModel(config).to(device)
 
+    diag_cfg = DiagnosticsConfig(
+        enabled=True,
+        report_interval_seconds=2.0,
+        compute_grad_norms=True,
+        compute_param_norms=True,
+        compute_ema_alignment=True,
+    )
+    diagnostics = DiagnosticsCollector(model, diag_cfg)
+
     runner = model.build_runner(
-        level_frequencies=[300, 100],
+        level_frequencies=[1000, 100],
         time_scale=1.0,
         batch_size=1,
         device=device,
@@ -119,14 +128,8 @@ def main():
 
     print(f"\n  [m] toggle mode  |  Ctrl+C to quit")
     print(f"  Starting in {mode.name} mode\n")
-    print(
-        f"{'tick':>6s}  {'mode':>8s}  {'surprise':>8s}  "
-        f"{'model[0]':>8s}  {'model[1]':>8s}  {'prev[0]':>8s}  {'prev[1]':>8s}"
-    )
-    print("-" * 74)
 
     tick_count = 0
-    last_print = time.monotonic()
 
     try:
         while rclpy.ok():
@@ -137,11 +140,12 @@ def main():
                     if mode == OperationMode.DRIVE
                     else OperationMode.DRIVE
                 )
+                print(f"\n  >>> switched to {mode.name} mode\n", flush=True)
 
             if mode == OperationMode.IMITATE:
                 prev_action = _action_from_obs(obs, action_keys, device)
 
-            result = runner.tick(obs, prev_action)
+            result = runner.tick(obs, prev_action, diagnostics=diagnostics)
 
             if mode == OperationMode.IMITATE:
                 obs = env.step({})
@@ -151,37 +155,27 @@ def main():
                 prev_action = result.action
 
             tick_count += 1
-            now = time.monotonic()
 
-            if now - last_print >= 0.5 or ch == "m":
+            if diagnostics.should_report():
                 ma = result.action[0].tolist()
                 pa = (
                     prev_action[0].tolist()
                     if prev_action is not None
                     else [float("nan"), float("nan")]
                 )
-                s = (
-                    result.total_surprise.item()
-                    if result.total_surprise is not None
-                    else float("nan")
-                )
                 print(
-                    f"{tick_count:6d}  "
-                    f"{mode.name:>8s}  "
-                    f"{s:8.4f}  "
-                    f"{ma[0]:8.4f}  "
-                    f"{ma[1]:8.4f}  "
-                    f"{pa[0]:8.4f}  "
-                    f"{pa[1]:8.4f}",
-                    flush=True,
+                    f"\n  tick={tick_count}  mode={mode.name}  "
+                    f"model=[{ma[0]:.4f}, {ma[1]:.4f}]  "
+                    f"prev=[{pa[0]:.4f}, {pa[1]:.4f}]"
                 )
-                last_print = now
+                print(diagnostics.report(), flush=True)
 
             runner.clock.sleep_until_next_tick()
 
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:
+        diagnostics.close()
         kb.stop()
         env.close()
         rclpy.shutdown()

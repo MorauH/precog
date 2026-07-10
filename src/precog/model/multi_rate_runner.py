@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 
 from .hierarchical_clock import ClockConfig, HierarchicalClock
 from .level_state import LevelState
+from .diagnostics import DiagnosticsCollector
 
 if TYPE_CHECKING:
     from .model import HierarchicalPCWorldModel
@@ -74,7 +76,11 @@ class MultiRateRunner:
         self,
         obs_dict: Dict[str, torch.Tensor],
         prev_action: Optional[torch.Tensor] = None,
+        *,
+        diagnostics: Optional[DiagnosticsCollector] = None,
     ) -> TickResult:
+        t_start = time.monotonic() if diagnostics is not None else 0.0
+
         self.clock.tick()
         current_tick = self.clock._tick_count
         sim_time = self.clock.sim_time()
@@ -172,6 +178,19 @@ class MultiRateRunner:
         action = self.model.control_head(torch.cat([z_ctrl, z_hat_ctrl], dim=-1))[
             :, -1
         ]  # (B, action_dim)
+
+        if diagnostics is not None and diagnostics.cfg.enabled:
+            diagnostics.record_tick(
+                TickResult(
+                    action=action,
+                    level_states=list(self._level_states),
+                    updated_levels=updated_levels,
+                    sim_time=sim_time,
+                    total_surprise=total_surprise,
+                ),
+                self,
+                process_time=time.monotonic() - t_start,
+            )
 
         return TickResult(
             action=action,

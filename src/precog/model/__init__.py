@@ -1,5 +1,6 @@
 from .config import *
 from .control_head import ControlHead
+from .diagnostics import DiagnosticsCollector, DiagnosticsConfig
 from .fnn import FNN
 from .hierarchical_clock import ClockConfig, HierarchicalClock
 from .level_state import LevelState

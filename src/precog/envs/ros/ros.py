@@ -7,6 +7,7 @@ file reads that config, dynamically resolves the ROS message classes,
 wires up subscriptions/publishers, and exposes a Gym-like reset/step
 API. Adding or removing a topic never requires touching this file.
 """
+
 import threading
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -69,31 +70,47 @@ class ROSEnvironment(Node):
 
         qos = _build_qos(cfg.get("qos_default", {}))
 
-        self.obs_specs = [ObsSpec(**o) for o in cfg.get("observations", [])]
+        obs_cfgs = list(cfg.get("observations", []))
+        obs_cfgs.extend(cfg.get("expert_action_observations", []))
+        self.obs_specs = [ObsSpec(**o) for o in obs_cfgs]
         self.action_specs = [ActionSpec(**a) for a in cfg.get("actions", [])]
 
-        self._latest_obs: dict[str, Optional[np.ndarray]] = {s.key: None for s in self.obs_specs}
+        self._latest_obs: dict[str, Optional[np.ndarray]] = {
+            s.key: None for s in self.obs_specs
+        }
         self._latest_obs_time: dict[str, float] = {s.key: 0.0 for s in self.obs_specs}
         self._ready_events = {s.key: threading.Event() for s in self.obs_specs}
 
         # --- Dynamically wire up subscriptions ---
         for spec in self.obs_specs:
             if spec.codec not in OBS_CODECS:
-                raise ValueError(f"No codec registered for '{spec.codec}' (obs key '{spec.key}')")
+                raise ValueError(
+                    f"No codec registered for '{spec.codec}' (obs key '{spec.key}')"
+                )
             msg_cls = get_message(spec.msg_type)
-            self.create_subscription(msg_cls, spec.topic, self._make_obs_callback(spec), qos)
-            self.get_logger().info(f"Subscribed: {spec.topic} ({spec.msg_type}) -> '{spec.key}'")
+            self.create_subscription(
+                msg_cls, spec.topic, self._make_obs_callback(spec), qos
+            )
+            self.get_logger().info(
+                f"Subscribed: {spec.topic} ({spec.msg_type}) -> '{spec.key}'"
+            )
 
         # --- Dynamically wire up publishers ---
         self._action_publishers: dict[str, Any] = {}
         self._action_msg_cls: dict[str, Any] = {}
         for spec in self.action_specs:
             if spec.codec not in ACTION_CODECS:
-                raise ValueError(f"No codec registered for '{spec.codec}' (action key '{spec.key}')")
+                raise ValueError(
+                    f"No codec registered for '{spec.codec}' (action key '{spec.key}')"
+                )
             msg_cls = get_message(spec.msg_type)
             self._action_msg_cls[spec.key] = msg_cls
-            self._action_publishers[spec.key] = self.create_publisher(msg_cls, spec.topic, qos)
-            self.get_logger().info(f"Publishing: '{spec.key}' -> {spec.topic} ({spec.msg_type})")
+            self._action_publishers[spec.key] = self.create_publisher(
+                msg_cls, spec.topic, qos
+            )
+            self.get_logger().info(
+                f"Publishing: '{spec.key}' -> {spec.topic} ({spec.msg_type})"
+            )
 
         # --- Resolve transforms ---
         transform_names = cfg.get("transforms", [])
@@ -117,7 +134,9 @@ class ROSEnvironment(Node):
             array = codec(msg)
             with self.state_lock:
                 self._latest_obs[spec.key] = array
-                self._latest_obs_time[spec.key] = self.get_clock().now().nanoseconds / 1e9
+                self._latest_obs_time[spec.key] = (
+                    self.get_clock().now().nanoseconds / 1e9
+                )
             self._ready_events[spec.key].set()
 
         return _cb
@@ -129,7 +148,9 @@ class ROSEnvironment(Node):
         self.get_logger().info(f"Waiting for: {required}")
         for key in required:
             if not self._ready_events[key].wait(timeout_sec):
-                raise TimeoutError(f"No message received on '{key}' within {timeout_sec}s")
+                raise TimeoutError(
+                    f"No message received on '{key}' within {timeout_sec}s"
+                )
         return self._snapshot()
 
     def _snapshot(self) -> dict[str, Optional[torch.Tensor]]:
@@ -145,7 +166,9 @@ class ROSEnvironment(Node):
                 if value is None or age > spec.max_age_sec:
                     out[spec.key] = None
                 else:
-                    out[spec.key] = torch.as_tensor(value, device=self.device).unsqueeze(0)
+                    out[spec.key] = torch.as_tensor(
+                        value, device=self.device
+                    ).unsqueeze(0)
         for fn in self._transforms:
             out = fn(out)
         return out
@@ -170,7 +193,9 @@ if __name__ == "__main__":
     import sys
 
     rclpy.init()
-    env = ROSEnvironment(config_path=sys.argv[1] if len(sys.argv) > 1 else "env_config.yaml")
+    env = ROSEnvironment(
+        config_path=sys.argv[1] if len(sys.argv) > 1 else "env_config.yaml"
+    )
     try:
         obs = env.reset()
         print("Initial obs keys:", list(obs.keys()))

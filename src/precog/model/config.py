@@ -165,22 +165,27 @@ def resolve_config_dims(
     config: ModelConfig,
     env_obs_shapes: Dict[str, tuple],
 ) -> ModelConfig:
-    """Return a copy of *config* with every modality's ``input_dim`` resolved
-    from ``env_obs_shapes``.
+    """Return a copy of *config* with every modality's ``input_dim`` resolved.
 
-    ``env_obs_shapes`` is a map ``{observation_key: shape_tuple}`` as
-    extracted from the env config (observations + transform outputs).
+    ``env_obs_shapes`` is ``{observation_key: shape_tuple}`` from the env
+    config (observations + transform outputs).
 
-    If a modality already has ``input_dim`` set, it is validated against
-    the env shape.  If it is ``None``, the value is derived from the env.
+    - ``input_dim=None`` → resolved from ``env_obs_shapes[mod.name][-1]``.
+    - ``input_dim`` explicitly set AND key is in env shapes → validated.
+    - ``input_dim`` explicitly set AND key is NOT in env shapes → used as-is
+      (internal modality, e.g. "control" which is injected by the runner).
 
-    Raises :class:`ValueError` for missing keys or dimension mismatches.
+    Raises :class:`ValueError` for missing auto-resolve keys or mismatches.
     """
     resolved_modalities: List[ModalityConfig] = []
     for mod in config.modalities:
         if mod.name not in env_obs_shapes:
+            if mod.input_dim is not None:
+                resolved_modalities.append(mod)
+                continue
             raise ValueError(
-                f"Modality '{mod.name}' not found in env observation shapes. "
+                f"Modality '{mod.name}' not found in env observation shapes "
+                f"and no explicit input_dim set. "
                 f"Available keys: {sorted(env_obs_shapes.keys())}"
             )
 
@@ -222,32 +227,32 @@ def resolve_config_dims(
 
 DEFAULT_CONFIG = ModelConfig(
     modalities=[
-        ModalityConfig(name="current_steering", output_dim=16, hidden_dims=[]),
+        ModalityConfig(name="current_steering", output_dim=1, hidden_dims=[]),
         ModalityConfig(
-            name="best_path_relative_sampling", output_dim=32, hidden_dims=[32]
+            name="best_path_relative_sampling", output_dim=4, hidden_dims=[32]
         ),
         ModalityConfig(name="car_pose", output_dim=8, hidden_dims=[]),
+        ModalityConfig(
+            name="control",
+            input_dim=2,
+            output_dim=4,
+            hidden_dims=[],
+        ),
     ],
     level_configs=[
         PCLevelConfig(
-            d_representation=128,
-            ssm=SSMConfig(d_state=64, dt_min=0.001, dt_max=0.01),
-            prediction_head_hidden=[64],
-            forward_head_hidden=[64],
+            d_representation=32,
+            ssm=SSMConfig(d_state=16, dt_min=0.001, dt_max=0.01),
+            prediction_head_hidden=[16],
+            forward_head_hidden=[16],
         ),
         PCLevelConfig(
-            d_representation=128,
-            ssm=SSMConfig(d_state=64, dt_min=0.01, dt_max=0.1),
-            prediction_head_hidden=[64],
-            forward_head_hidden=[64],
-        ),
-        PCLevelConfig(
-            d_representation=64,
-            ssm=SSMConfig(d_state=32, dt_min=0.1, dt_max=1.0),
-            prediction_head_hidden=[64],
-            forward_head_hidden=[32],
+            d_representation=32,
+            ssm=SSMConfig(d_state=16, dt_min=0.01, dt_max=0.1),
+            prediction_head_hidden=[16],
+            forward_head_hidden=[16],
         ),
     ],
-    control_head=ControlHeadConfig(hidden_dims=[64, 32], output_dim=2),
+    control_head=ControlHeadConfig(hidden_dims=[16, 8], output_dim=2),
     control_level_idx=1,
 )

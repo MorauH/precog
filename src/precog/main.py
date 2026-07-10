@@ -1,3 +1,14 @@
+import sys
+import select
+import termios
+import tty
+import threading
+import queue
+import time
+from enum import Enum, auto
+from typing import Optional
+
+import numpy as np
 import rclpy
 import torch
 import yaml
@@ -10,22 +21,84 @@ from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
 ENV_CONFIG_PATH = "./src/precog/envs/ros/env_config.yaml"
 
 
+class OperationMode(Enum):
+    DRIVE = auto()
+    IMITATE = auto()
+
+
+class KeyboardReader:
+    """Threaded stdin reader — won't block or clash with ROS logging."""
+
+    def __init__(self):
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _read_loop(self):
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while self._running:
+                readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if readable:
+                    ch = sys.stdin.read(1)
+                    if ch == "\x03":
+                        raise KeyboardInterrupt
+                    self._queue.put(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+
+    def get(self) -> Optional[str]:
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
+
+
+def _action_to_dict(tensor: torch.Tensor, keys: list[str]) -> dict[str, np.ndarray]:
+    values = tensor[0].cpu().numpy()
+    return {k: values[i] for i, k in enumerate(keys)}
+
+
+def _action_from_obs(
+    obs: dict, action_keys: list[str], device: torch.device
+) -> Optional[torch.Tensor]:
+    values = []
+    for k in action_keys:
+        v = obs.get(f"expert_{k}")
+        if v is None:
+            return None
+        values.append(v.squeeze())
+    return torch.stack(values, dim=-1).unsqueeze(0).to(device)
+
+
 def main():
     rclpy.init()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
 
-    # Resolve model modality input_dim from env config shapes
     with open(ENV_CONFIG_PATH) as f:
         env_cfg = yaml.safe_load(f)
     env_shapes = _env_shapes_from_yaml(env_cfg)
-
     config = resolve_config_dims(DEFAULT_CONFIG, env_shapes)
+
+    print("Modalities:")
     for m in config.modalities:
-        print(f"  {m.name}: input_dim={m.input_dim} → output_dim={m.output_dim}")
+        tag = " [internal]" if m.name == "control" else ""
+        print(f"  {m.name}: {m.input_dim}{tag} -> {m.output_dim}")
 
     env = ROSEnvironment(config_path=ENV_CONFIG_PATH, device=device)
+    action_keys = [s.key for s in env.action_specs]
     model = HierarchicalPCWorldModel(config).to(device)
 
     runner = model.build_runner(
@@ -35,20 +108,79 @@ def main():
         device=device,
     )
 
+    kb = KeyboardReader()
+    kb.start()
+
     obs = env.reset()
+    prev_action: Optional[torch.Tensor] = None
+    mode = OperationMode.IMITATE
+
+    print(f"\n  [m] toggle mode  |  Ctrl+C to quit")
+    print(f"  Starting in {mode.name} mode\n")
+    print(
+        f"{'tick':>6s}  {'mode':>8s}  {'surprise':>8s}  "
+        f"{'model[0]':>8s}  {'model[1]':>8s}  {'prev[0]':>8s}  {'prev[1]':>8s}"
+    )
+    print("-" * 74)
+
+    tick_count = 0
+    last_print = time.monotonic()
 
     try:
-        prev_action = None
-
         while rclpy.ok():
+            ch = kb.get()
+            if ch == "m":
+                mode = (
+                    OperationMode.IMITATE
+                    if mode == OperationMode.DRIVE
+                    else OperationMode.DRIVE
+                )
+
+            if mode == OperationMode.IMITATE:
+                prev_action = _action_from_obs(obs, action_keys, device)
+
             result = runner.tick(obs, prev_action)
-            obs = env.step(result.action)
-            prev_action = result.action
+
+            if mode == OperationMode.IMITATE:
+                obs = env.step({})
+            else:
+                act_dict = _action_to_dict(result.action, action_keys)
+                obs = env.step(act_dict)
+                prev_action = result.action
+
+            tick_count += 1
+            now = time.monotonic()
+
+            if now - last_print >= 0.5 or ch == "m":
+                ma = result.action[0].tolist()
+                pa = (
+                    prev_action[0].tolist()
+                    if prev_action is not None
+                    else [float("nan"), float("nan")]
+                )
+                s = (
+                    result.total_surprise.item()
+                    if result.total_surprise is not None
+                    else float("nan")
+                )
+                print(
+                    f"{tick_count:6d}  "
+                    f"{mode.name:>8s}  "
+                    f"{s:8.4f}  "
+                    f"{ma[0]:8.4f}  "
+                    f"{ma[1]:8.4f}  "
+                    f"{pa[0]:8.4f}  "
+                    f"{pa[1]:8.4f}",
+                    flush=True,
+                )
+                last_print = now
+
             runner.clock.sleep_until_next_tick()
 
     except KeyboardInterrupt:
-        pass
+        print("\nShutting down.")
     finally:
+        kb.stop()
         env.close()
         rclpy.shutdown()
 

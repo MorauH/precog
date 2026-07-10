@@ -197,8 +197,8 @@ class MultiRateRunner:
 
             if not self.clock.should_update(i):
                 # Level i is NOT due — reuse cached outputs, no forward pass.
-                # z_input for level i+1 is either the accumulation or the
-                # last z (handled when level i+1 fires below).
+                if state.last_z is not None:
+                    z_input = state.last_z.unsqueeze(1)
                 continue
 
             updated_levels.append(i)
@@ -206,15 +206,21 @@ class MultiRateRunner:
             # Build the sequence input for this level
             seq = self._pop_sequence_for_level(i, z_input)  # (B, T, d)
 
-            # Downward prediction from level above (held value)
+            # Downward prediction from level above — compute from held z
             pred_from_above: Optional[torch.Tensor] = None
             if i + 1 < len(self._level_states):
-                above = self._level_states[i + 1]
-                if above.last_z_hat_next is not None:
-                    pred_from_above = above.last_z_hat_next.unsqueeze(1)  # (B,1,d)
+                above_state = self._level_states[i + 1]
+                if above_state.last_z is not None:
+                    above_level = self.model.levels[i + 1]
+                    with torch.no_grad():
+                        pfa = above_level.predict_downward(
+                            above_state.last_z
+                        )  # (B, d_repr_of_current)
+                    T = seq.shape[1]
+                    pred_from_above = pfa.unsqueeze(1).expand(-1, T, -1)  # (B, T, d)
 
             # Forward through this level
-            z_seq, z_hat_next_seq, _, h_new, h_target_new, epsilon = level.forward(
+            z_seq, _, z_hat_next_seq, _, h_new, h_target_new, epsilon = level.forward(
                 seq,
                 state.hidden,
                 state.hidden_target,
@@ -306,9 +312,15 @@ class MultiRateRunner:
         """Run modality encoders and concatenate. Returns (B, d_level0)."""
         encoded = []
         for name, encoder in self.model.modality_encoders.items():
-            x = obs_dict[name]  # (B, sensor_dim)
-            if name == "control" and prev_action is not None:
-                x = prev_action
+            if name == "control":
+                if prev_action is not None:
+                    x = prev_action
+                else:
+                    ctrl_cfg = self.model.config.control_head
+                    x = torch.zeros(1, ctrl_cfg.output_dim, device=self.device)
+                    x = x.expand(self.cfg.batch_size, -1)
+            else:
+                x = obs_dict[name]
             z0 = encoder(x.unsqueeze(1))  # encoder expects (B, T, d)
             encoded.append(z0[:, -1])  # (B, d_out)
         return torch.cat(encoded, dim=-1)  # (B, d_level0)

@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from .fnn import FNN
 from .ssm import SelectiveSSM
-from .pc_level import PCLevel
+from .pc_level_jepa import PCLevel
 from .modality_encoder import ModalityEncoder
 from .control_head import ControlHead
 from .config import ModelConfig
@@ -131,50 +131,82 @@ class HierarchicalPCWorldModel(nn.Module):
         action_pred (B, T, action_dim)  if return_all is False, else a dict.
         """
         batch = next(iter(obs_dict.values())).shape[0]
+        obs_device = next(iter(obs_dict.values())).device
 
-        # Initialise hidden states if not provided
         if hidden_states is None:
-            hidden_states = [level.init_hidden(batch)[0] for level in self.levels]
+            hidden_states = [
+                level.init_hidden(batch, device=obs_device) for level in self.levels
+            ]
         if hidden_states_target is None:
             hidden_states_target = [
-                level.init_hidden(batch)[1] for level in self.levels
+                level.init_hidden_target(batch, device=obs_device)
+                for level in self.levels
             ]
 
         # Level 0 encoding
         level0_list = []
         for name, encoder in self.modality_encoders.items():
-            x = obs_dict[name]
-            if name == "control" and prev_action is not None:
-                x = prev_action.unsqueeze(1) if prev_action.dim() == 2 else prev_action
+            if name == "control":
+                if prev_action is not None:
+                    x = (
+                        prev_action.unsqueeze(1)
+                        if prev_action.dim() == 2
+                        else prev_action
+                    )
+                else:
+                    ctrl_dim = self.config.control_head.output_dim
+                    x = torch.zeros(batch, 1, ctrl_dim, device=obs_device)
+            else:
+                x = obs_dict[name]
             level0_list.append(encoder(x))
 
         z_level = torch.cat(level0_list, dim=-1)  # (B, T, d_level0)
 
-        # Hierarchical forward
-        level_outputs: List[torch.Tensor] = []
+        # ---------------------------------------------------------------- #
+        # Phase 1 — Bottom-up: raw representations (no top-down)
+        # ---------------------------------------------------------------- #
+        z_below_inputs: List[torch.Tensor] = []
+        z_levels_raw: List[torch.Tensor] = []
         z_hat_next_list: List[torch.Tensor] = []
+        pred_below_list: List[torch.Tensor] = []
         prediction_errors: List[torch.Tensor] = []
         h_new_list: List[torch.Tensor] = []
         h_target_new_list: List[torch.Tensor] = []
 
+        curr = z_level
         for i, level in enumerate(self.levels):
-            pred_from_above = level_outputs[-1] if i > 0 else None
-
-            z_seq, z_hat_next_seq, pred_below_seq, h_new, h_target_new, epsilon = (
+            z_below_inputs.append(curr)
+            z_seq, _, z_hat_next_seq, pred_below_seq, h_new, h_target_new, epsilon = (
                 level.forward(
-                    z_level,
+                    curr,
                     hidden_states[i],
                     hidden_states_target[i],
-                    pred_from_above,
+                    None,
                 )
             )
-
             h_new_list.append(h_new[:, -1])
             h_target_new_list.append(h_target_new[:, -1])
-            level_outputs.append(z_seq)
+            z_levels_raw.append(z_seq)
             z_hat_next_list.append(z_hat_next_seq)
+            pred_below_list.append(pred_below_seq)
             prediction_errors.append(epsilon)
-            z_level = z_seq
+            curr = z_seq
+
+        # ---------------------------------------------------------------- #
+        # Phase 2 — Top-down: correct lower levels from above
+        # ---------------------------------------------------------------- #
+        level_outputs = list(z_levels_raw)
+        for i in range(len(self.levels) - 2, -1, -1):
+            pred_from_above_seq = pred_below_list[i + 1]
+            z_corr, z_hat_corr, pred_below_corr, eps_corr = self.levels[
+                i
+            ].apply_top_down_correction(
+                z_levels_raw[i], z_below_inputs[i], pred_from_above_seq
+            )
+            level_outputs[i] = z_corr
+            z_hat_next_list[i] = z_hat_corr
+            pred_below_list[i] = pred_below_corr
+            prediction_errors[i] = eps_corr
 
         # Control head
         ctrl_idx = self.control_level_idx

@@ -149,9 +149,9 @@ class PCLevel(nn.Module):
         # ------------------------------------------------------------------
         if d_above is not None:
             self.error_correction = FNN(
-                input_dim=config.d_representation,   # ε_above has same dim as z_t
+                input_dim=config.d_representation,  # ε_above has same dim as z_t
                 output_dim=config.d_representation,
-                hidden_dims=[],                       # linear correction by default
+                hidden_dims=[],  # linear correction by default
             )
         else:
             self.error_correction = None
@@ -178,68 +178,128 @@ class PCLevel(nn.Module):
     # -----------------------------------------------------------------------
     # Target update
     # -----------------------------------------------------------------------
-    
+
     @torch.no_grad()
     def update_target_ema(self, tau: float = 0.997) -> None:
         """Call after every optimizer step."""
         for p_online, p_target in zip(
-            self.ssm.parameters(),
-            self.ssm_target.parameters()
+            self.ssm.parameters(), self.ssm_target.parameters()
         ):
             p_target.data = tau * p_target.data + (1 - tau) * p_online.data
 
     # -----------------------------------------------------------------------
+    # Top-down correction (refinement pass, no SSM re-run)
+    # -----------------------------------------------------------------------
+
+    def apply_top_down_correction(
+        self,
+        z_raw_seq: torch.Tensor,  # (B, T, d_repr) from pass 1
+        z_below_seq: torch.Tensor,  # (B, T, d_below) original input
+        pred_from_above_seq: torch.Tensor,  # (B, T, d_repr) from level above
+    ) -> Tuple[
+        torch.Tensor,  # z_corr_seq         (B, T, d_repr)
+        torch.Tensor,  # z_hat_next_seq     (B, T, d_repr)
+        torch.Tensor,  # pred_below_seq     (B, T, d_below)
+        torch.Tensor,  # epsilon_below_seq  (B, T, d_below)
+    ]:
+        """Apply top-down PC correction without re-running the SSM.
+
+        Called during the top-down refinement pass after all levels have
+        computed their raw representations.  Re-applies:
+            z_corr = z_raw + α·tanh · correction(z_raw - pred_from_above)
+        and recomputes downstream heads (predict_forward, predict_downward,
+        epsilon_below).
+
+        If error_correction is None (top level, unused), z_corr == z_raw.
+        """
+        if self.error_correction is None:
+            return (
+                z_raw_seq,
+                self.predict_forward(z_raw_seq.reshape(-1, self.d_repr)).reshape(
+                    z_raw_seq.shape
+                ),
+                self.predict_downward(z_raw_seq.reshape(-1, self.d_repr)).reshape(
+                    *z_raw_seq.shape[:-1], self.d_below
+                ),
+                torch.zeros_like(z_below_seq),
+            )
+
+        seq_len = z_raw_seq.shape[1]
+        z_corr_list, z_hat_next_list, pred_below_list, eps_list = [], [], [], []
+
+        for t in range(seq_len):
+            z_raw = z_raw_seq[:, t]  # (B, d_repr)
+            pfa = pred_from_above_seq[:, t]  # (B, d_repr)
+            z_below = z_below_seq[:, t]  # (B, d_below)
+
+            epsilon_above = z_raw - pfa
+            correction = self.error_correction(epsilon_above)
+            z_corr = z_raw + torch.tanh(self.alpha) * correction
+
+            z_corr_list.append(z_corr)
+            z_hat_next_list.append(self.predict_forward(z_corr))
+            pred_below_list.append(self.predict_downward(z_corr))
+            eps_list.append(z_below.detach() - pred_below_list[-1])
+
+        return (
+            torch.stack(z_corr_list, dim=1),
+            torch.stack(z_hat_next_list, dim=1),
+            torch.stack(pred_below_list, dim=1),
+            torch.stack(eps_list, dim=1),
+        )
+
+    # -----------------------------------------------------------------------
     # Core forward interfaces
     # -----------------------------------------------------------------------
-    
+
     def step(
         self,
-        z_below: torch.Tensor,                      # (batch, d_below)
-        h: torch.Tensor,                            # (batch, d_state) - online
-        h_target: torch.Tensor,                     # (batch, d_state) - target
-        pred_from_above: Optional[torch.Tensor],    # (batch, d_repr) | None
+        z_below: torch.Tensor,  # (batch, d_below)
+        h: torch.Tensor,  # (batch, d_state) - online
+        h_target: torch.Tensor,  # (batch, d_state) - target
+        pred_from_above: Optional[torch.Tensor],  # (batch, d_repr) | None
     ) -> Tuple[
-        torch.Tensor,   # z_t          online representation  (batch, d_repr)
-        torch.Tensor,   # z_t_target   target representation  (batch, d_repr)
-        torch.Tensor,   # z_hat_next   forward prediction     (batch, d_repr)
-        torch.Tensor,   # pred_below   downward prediction    (batch, d_below)
-        torch.Tensor,   # h_new        updated hidden state   (batch, d_state)
-        torch.Tensor,   # h_target_new updated hidden state   (batch, d_state)
-        torch.Tensor,   # epsilon_below prediction error      (batch, d_below)
+        torch.Tensor,  # z_t          online representation  (batch, d_repr)
+        torch.Tensor,  # z_t_target   target representation  (batch, d_repr)
+        torch.Tensor,  # z_hat_next   forward prediction     (batch, d_repr)
+        torch.Tensor,  # pred_below   downward prediction    (batch, d_below)
+        torch.Tensor,  # h_new        updated hidden state   (batch, d_state)
+        torch.Tensor,  # h_target_new updated hidden state   (batch, d_state)
+        torch.Tensor,  # epsilon_below prediction error      (batch, d_below)
     ]:
         """
         Process a single timestep — used during online inference and
         step-by-step continuous learning on the car.
- 
+
         JEPA integration
         ────────────────
         The step now runs two SSM paths in parallel:
- 
+
           Online path  (self.ssm)        — receives gradients, drives learning.
           Target path  (self.ssm_target) — no gradients, EMA-updated only.
- 
+
         predict_forward reads from z_t (online) and produces ẑ_{t+1}.
         The JEPA loss is computed *outside* this function by the training loop:
- 
+
             jepa_loss_t = MSE(ẑ_{t+1},  z_target_{t+1}.detach())
                                 ↑ from this step    ↑ from next step's z_t_target
- 
+
         Gradients flow:  jepa_loss → predict_forward → online SSM
         No gradients to: target SSM (detach enforced by requires_grad=False + no_grad)
- 
+
         PC integration
         ──────────────
         predict_downward and error propagation are unchanged. They operate on
         z_t (online) so they remain part of the gradient graph as before.
         The PC loss and JEPA loss are separate terms summed in the training loop.
- 
+
         Args:
             z_below:         Representation from the level below at time t.
             h:               Online SSM hidden state from t-1.
             h_target:        Target SSM hidden state from t-1.
             pred_from_above: Top-down prediction of this level from level above.
                              None if this is the top level.
- 
+
         Returns:
             z_t:           Online representation (used for PC + control).
             z_t_target:    Target representation (used as JEPA target at t+1).
@@ -249,10 +309,10 @@ class PCLevel(nn.Module):
             h_target_new:  Updated target hidden state.
             epsilon_below: PC prediction error for the level below.
                            Magnitude is the runtime uncertainty signal.
-        """ 
+        """
         # ── (a) Online path — gradient-enabled ────────────────────────────
-        z_raw, h_new = self.ssm.step(z_below, h)               # (batch, d_repr)
- 
+        z_raw, h_new = self.ssm.step(z_below, h)  # (batch, d_repr)
+
         # ── (b) Target path — no gradients ────────────────────────────────
         #    z_t_target is the JEPA prediction target for the *previous*
         #    timestep's z_hat_next. The training loop pairs them as:
@@ -260,96 +320,114 @@ class PCLevel(nn.Module):
         with torch.no_grad():
             z_t_target, h_target_new = self.ssm_target.step(
                 z_below, h_target
-            )                                                   # (batch, d_repr)
- 
+            )  # (batch, d_repr)
+
         # ── (c) Top-down PC error correction — online path only ───────────
         #    ε_above = z_raw - pred_from_above  (surprise at this level)
         #    z_t = z_raw + α · correction(ε_above)
         #    The target path is not modulated: it must remain a clean,
         #    stable encoding of the input for use as a JEPA target.
         if pred_from_above is not None and self.error_correction is not None:
-            epsilon_above = z_raw - pred_from_above             # (batch, d_repr)
-            correction = self.error_correction(epsilon_above)   # (batch, d_repr)
+            epsilon_above = z_raw - pred_from_above  # (batch, d_repr)
+            correction = self.error_correction(epsilon_above)  # (batch, d_repr)
             z_t = z_raw + torch.tanh(self.alpha) * correction
         else:
             z_t = z_raw
- 
+
         # ── (d) Predict downward — PC generative path ─────────────────────
-        pred_below = self.predict_downward(z_t)                 # (batch, d_below)
- 
+        pred_below = self.predict_downward(z_t)  # (batch, d_below)
+
         # ── (e) Predict forward — JEPA anticipatory path ──────────────────
         #    Gradients flow through predict_forward and back into the online
         #    SSM. z_t_target (next step) is the target — detached in the
         #    training loop, not here, so we can accumulate it freely.
-        z_hat_next = self.predict_forward(z_t)                  # (batch, d_repr)
- 
+        z_hat_next = self.predict_forward(z_t)  # (batch, d_repr)
+
         # ── (f) PC prediction error for the level below ───────────────────
         #    z_below is detached so gradients flow through pred_below only,
         #    preserving the PC local learning rule.
-        epsilon_below = z_below.detach() - pred_below           # (batch, d_below)
- 
-        return z_t, z_t_target, z_hat_next, pred_below, h_new, h_target_new, epsilon_below
-    
+        epsilon_below = z_below.detach() - pred_below  # (batch, d_below)
+
+        return (
+            z_t,
+            z_t_target,
+            z_hat_next,
+            pred_below,
+            h_new,
+            h_target_new,
+            epsilon_below,
+        )
+
     def forward(
         self,
-        z_below_seq: torch.Tensor,                          # (batch, seq, d_below)
-        h0: Optional[torch.Tensor] = None,                  # (batch, d_state)
-        h0_target: Optional[torch.Tensor] = None,           # (batch, d_state)
-        pred_from_above_seq: Optional[torch.Tensor] = None, # (batch, seq, d_repr)
+        z_below_seq: torch.Tensor,  # (batch, seq, d_below)
+        h0: Optional[torch.Tensor] = None,  # (batch, d_state)
+        h0_target: Optional[torch.Tensor] = None,  # (batch, d_state)
+        pred_from_above_seq: Optional[torch.Tensor] = None,  # (batch, seq, d_repr)
     ) -> Tuple[
-        torch.Tensor,   # z_seq             (batch, seq, d_repr)
-        torch.Tensor,   # z_target_seq      (batch, seq, d_repr)
-        torch.Tensor,   # z_hat_next_seq    (batch, seq, d_repr)
-        torch.Tensor,   # pred_below_seq    (batch, seq, d_below)
-        torch.Tensor,   # h_final           (batch, d_state)
-        torch.Tensor,   # h_target_final    (batch, d_state)
-        torch.Tensor,   # epsilon_below_seq (batch, seq, d_below)
+        torch.Tensor,  # z_seq             (batch, seq, d_repr)
+        torch.Tensor,  # z_target_seq      (batch, seq, d_repr)
+        torch.Tensor,  # z_hat_next_seq    (batch, seq, d_repr)
+        torch.Tensor,  # pred_below_seq    (batch, seq, d_below)
+        torch.Tensor,  # h_final           (batch, d_state)
+        torch.Tensor,  # h_target_final    (batch, d_state)
+        torch.Tensor,  # epsilon_below_seq (batch, seq, d_below)
     ]:
         """
         Process a full sequence — used during offline pre-training on logs.
- 
+
         Iterates step() across time, accumulating all outputs.
- 
+
         JEPA loss is computed by the training loop after this call:
- 
+
             # Align: prediction at t should match target at t+1
             jepa_loss = MSE(
                 z_hat_next_seq[:, :-1],       # predictions  t=0..T-2
                 z_target_seq [:, 1: ].detach() # targets      t=1..T-1
             )
- 
+
         h_final and h_target_final can warm-start the next segment,
         preserving continuity across log file boundaries or lap transitions.
         """
         batch_size, seq_len, _ = z_below_seq.shape
         device = z_below_seq.device
- 
-        h        = h0        if h0        is not None else self.init_hidden(batch_size, device)
-        h_target = h0_target if h0_target is not None else self.init_hidden_target(batch_size, device)
- 
-        z_list, z_target_list, z_hat_next_list, pred_below_list, eps_list = [], [], [], [], []
- 
+
+        h = h0 if h0 is not None else self.init_hidden(batch_size, device)
+        h_target = (
+            h0_target
+            if h0_target is not None
+            else self.init_hidden_target(batch_size, device)
+        )
+
+        z_list, z_target_list, z_hat_next_list, pred_below_list, eps_list = (
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+
         for t in range(seq_len):
             pfa = pred_from_above_seq[:, t] if pred_from_above_seq is not None else None
- 
+
             z_t, z_t_target, z_hat_next, pred_below, h, h_target, eps = self.step(
                 z_below_seq[:, t], h, h_target, pfa
             )
- 
+
             z_list.append(z_t)
             z_target_list.append(z_t_target)
             z_hat_next_list.append(z_hat_next)
             pred_below_list.append(pred_below)
             eps_list.append(eps)
- 
+
         return (
-            torch.stack(z_list,          dim=1),
-            torch.stack(z_target_list,   dim=1),
+            torch.stack(z_list, dim=1),
+            torch.stack(z_target_list, dim=1),
             torch.stack(z_hat_next_list, dim=1),
             torch.stack(pred_below_list, dim=1),
             h,
             h_target,
-            torch.stack(eps_list,        dim=1),
+            torch.stack(eps_list, dim=1),
         )
 
     # -----------------------------------------------------------------------

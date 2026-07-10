@@ -126,7 +126,7 @@ transforms:
 # Used by the model-config resolution layer to derive modality input_dim.
 transform_output_keys:
   best_path_relative_sampling:
-    shape: [1, 9, 2]
+    shape: [1, 18]
 
 actions:
   - key: steering
@@ -138,3 +138,23 @@ actions:
     topic: /cmd/acc
     msg_type: std_msgs/msg/Float32
     codec: float
+
+# Action topics mirrored as observations, so the model can read the expert's
+# commands in IMITATE mode.  Not required — only populated when the expert is
+# actively publishing (i.e. IMITATE mode).
+expert_action_observations:
+  - key: expert_steering
+    topic: /cmd/steer
+    msg_type: std_msgs/msg/Float32
+    codec: float
+    shape: [1, 1]
+    max_age_sec: 0.5
+    required: false
+
+  - key: expert_acceleration
+    topic: /cmd/acc
+    msg_type: std_msgs/msg/Float32
+    codec: float
+    shape: [1, 1]
+    max_age_sec: 0.5
+    required: false

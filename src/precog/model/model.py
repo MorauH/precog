@@ -1,7 +1,3 @@
-"""
-model.py — HierarchicalPCWorldModel (multi-rate compatible)
-"""
-
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -12,81 +8,31 @@ import torch.nn as nn
 from .fnn import FNN
 from .ssm import SelectiveSSM
 from .pc_level_jepa import PCLevel
-from .modality_encoder import ModalityEncoder
 from .control_head import ControlHead
 from .config import ModelConfig
 from .multi_rate_runner import MultiRateRunner, RunnerConfig
 
 
 class HierarchicalPCWorldModel(nn.Module):
-    """
-    Hierarchical Predictive Coding World Model with JEPA stabilisation.
-
-    Architecture
-    ~~~~~~~~~~~~
-    Level 0  : Per-modality encoders (preserve sensor identity).
-    Level 1+ : PCLevels (each contains SelectiveSSM + prediction heads).
-    Control  : Head on top of the chosen mid-level (z_mid ‖ z_hat_mid).
-
-    Multi-rate execution
-    ~~~~~~~~~~~~~~~~~~~~
-    For multi-frequency control, wrap the model with a MultiRateRunner::
-
-        runner = model.build_runner(
-            level_frequencies=[100, 10, 1],
-            time_scale=1.0,
-        )
-        while True:
-            result = runner.tick(obs_dict, prev_action)
-            robot.send(result.action)
-            runner.clock.sleep_until_next_tick()
-
-    The model's `forward()` still works for training (full sequences, no
-    rate scheduling).
-    """
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        assert config.is_resolved, (
-            "ModelConfig modalities must have resolved input_dim. "
-            "Call resolve_config_dims() before constructing the model."
-        )
 
-        # ---------------------------------------------------------------- #
-        # Level 0: Modality-specific encoders
-        # ---------------------------------------------------------------- #
-        self.modality_encoders: nn.ModuleDict = nn.ModuleDict()
-        for mod in config.modalities:
-            input_dim = mod.input_dim
-            assert input_dim is not None
-            self.modality_encoders[mod.name] = ModalityEncoder(
-                input_dim=input_dim,
-                output_dim=mod.output_dim,
-                hidden_dim=getattr(mod, "hidden_dims", None),
-            )
+        prev_dim = config.d_input
 
-        # ---------------------------------------------------------------- #
-        # PC Levels
-        # ---------------------------------------------------------------- #
         self.levels: nn.ModuleList = nn.ModuleList()
-        prev_dim = config.d_level0
-
         for i, level_cfg in enumerate(config.level_configs):
             self.levels.append(
                 PCLevel(
                     d_below=prev_dim,
                     d_above=None
-                    if i == len(self.config.level_configs)
+                    if i == len(self.config.level_configs) - 1
                     else level_cfg.d_representation,
                     config=level_cfg,
                 )
             )
             prev_dim = level_cfg.d_representation
 
-        # ---------------------------------------------------------------- #
-        # Control Head
-        # ---------------------------------------------------------------- #
         ctrl_cfg = config.control_head
         control_input_dim = (
             config.level_configs[config.control_level_idx].d_representation * 2
@@ -112,24 +58,6 @@ class HierarchicalPCWorldModel(nn.Module):
         hidden_states_target: Optional[List[torch.Tensor]] = None,
         return_all: bool = False,
     ):
-        """Full-sequence forward pass for training.
-
-        Parameters
-        ----------
-        obs_dict:
-            Dict of (B, T, sensor_dim) tensors.
-        prev_action:
-            (B, T, action_dim) or (B, action_dim).
-        hidden_states / hidden_states_target:
-            Optional initial hidden states per level.  If None, zeros are
-            used.  Pass the returned ``h_new`` tensors to chain sequences.
-        return_all:
-            If True, return a dict with all intermediate outputs.
-
-        Returns
-        -------
-        action_pred (B, T, action_dim)  if return_all is False, else a dict.
-        """
         batch = next(iter(obs_dict.values())).shape[0]
         obs_device = next(iter(obs_dict.values())).device
 
@@ -143,24 +71,23 @@ class HierarchicalPCWorldModel(nn.Module):
                 for level in self.levels
             ]
 
-        # Level 0 encoding
-        level0_list = []
-        for name, encoder in self.modality_encoders.items():
-            if name == "control":
-                if prev_action is not None:
-                    x = (
-                        prev_action.unsqueeze(1)
-                        if prev_action.dim() == 2
-                        else prev_action
-                    )
-                else:
-                    ctrl_dim = self.config.control_head.output_dim
-                    x = torch.zeros(batch, 1, ctrl_dim, device=obs_device)
-            else:
-                x = obs_dict[name]
-            level0_list.append(encoder(x))
+        parts = [obs_dict[key] for key in self.config.observation_keys]
 
-        z_level = torch.cat(level0_list, dim=-1)  # (B, T, d_level0)
+        if prev_action is not None:
+            parts.append(
+                prev_action if prev_action.dim() == 3 else prev_action.unsqueeze(1)
+            )
+        else:
+            parts.append(
+                torch.zeros(
+                    batch,
+                    obs_dict[self.config.observation_keys[0]].shape[1],
+                    self.config.control_dim,
+                    device=obs_device,
+                )
+            )
+
+        z_level = torch.cat(parts, dim=-1)
 
         # ---------------------------------------------------------------- #
         # Phase 1 — Bottom-up: raw representations (no top-down)
@@ -177,15 +104,10 @@ class HierarchicalPCWorldModel(nn.Module):
         for i, level in enumerate(self.levels):
             z_below_inputs.append(curr)
             z_seq, _, z_hat_next_seq, pred_below_seq, h_new, h_target_new, epsilon = (
-                level.forward(
-                    curr,
-                    hidden_states[i],
-                    hidden_states_target[i],
-                    None,
-                )
+                level.forward(curr, hidden_states[i], hidden_states_target[i], None)
             )
-            h_new_list.append(h_new[:, -1])
-            h_target_new_list.append(h_target_new[:, -1])
+            h_new_list.append(h_new)
+            h_target_new_list.append(h_target_new)
             z_levels_raw.append(z_seq)
             z_hat_next_list.append(z_hat_next_seq)
             pred_below_list.append(pred_below_seq)
@@ -208,7 +130,6 @@ class HierarchicalPCWorldModel(nn.Module):
             pred_below_list[i] = pred_below_corr
             prediction_errors[i] = eps_corr
 
-        # Control head
         ctrl_idx = self.control_level_idx
         z_ctrl = level_outputs[ctrl_idx]
         z_hat_ctrl = z_hat_next_list[ctrl_idx]
@@ -223,7 +144,6 @@ class HierarchicalPCWorldModel(nn.Module):
             "z_hat_next": z_hat_next_list,
             "prediction_errors": prediction_errors,
             "total_surprise": sum(e.pow(2).mean() for e in prediction_errors),
-            # Updated hidden states (for chaining across sequence chunks)
             "hidden_states": h_new_list,
             "hidden_states_target": h_target_new_list,
         }
@@ -233,7 +153,6 @@ class HierarchicalPCWorldModel(nn.Module):
     # ------------------------------------------------------------------ #
 
     def update_ema(self, tau: float = 0.997):
-        """Update all target encoders (call after optimizer.step())."""
         for level in self.levels:
             level.update_target_ema(tau)
 
@@ -248,34 +167,8 @@ class HierarchicalPCWorldModel(nn.Module):
         batch_size: int = 1,
         device: str = "cpu",
         accumulate_for_upper: bool = True,
+        online_learning: bool = True,
     ) -> MultiRateRunner:
-        """Create a MultiRateRunner bound to this model.
-
-        Parameters
-        ----------
-        level_frequencies:
-            Hz for each level, index 0 = lowest/fastest.
-            Must have one entry per level (len == len(self.levels)).
-            E.g. [100, 10, 1] for a 3-level model.
-        time_scale:
-            Simulation speed multiplier.  1.0 = real-time.
-        batch_size, device:
-            Inference batch size and device for state tensors.
-        accumulate_for_upper:
-            See RunnerConfig.
-
-        Returns
-        -------
-        MultiRateRunner ready for online stepping.
-
-        Example
-        -------
-        >>> runner = model.build_runner([100, 10, 1], time_scale=5.0)
-        >>> for obs, act in env:
-        ...     result = runner.tick(obs, act)
-        ...     robot.send(result.action)
-        ...     runner.clock.sleep_until_next_tick()
-        """
         if len(level_frequencies) != len(self.levels):
             raise ValueError(
                 f"level_frequencies must have one entry per level "
@@ -287,5 +180,7 @@ class HierarchicalPCWorldModel(nn.Module):
             batch_size=batch_size,
             device=device,
             accumulate_for_upper=accumulate_for_upper,
+            online_learning=online_learning,
+            imitation_loss_weight=self.config.imitation_loss_weight,
         )
         return MultiRateRunner(self, cfg)

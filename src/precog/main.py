@@ -27,8 +27,6 @@ class OperationMode(Enum):
 
 
 class KeyboardReader:
-    """Threaded stdin reader — won't block or clash with ROS logging."""
-
     def __init__(self):
         self._queue: queue.Queue[str] = queue.Queue()
         self._running = False
@@ -92,20 +90,24 @@ def main():
     env_shapes = _env_shapes_from_yaml(env_cfg)
     config = resolve_config_dims(DEFAULT_CONFIG, env_shapes)
 
-    print("Modalities:")
-    for m in config.modalities:
-        tag = " [internal]" if m.name == "control" else ""
-        print(f"  {m.name}: {m.input_dim}{tag} -> {m.output_dim}")
+    print(f"Observation keys: {config.observation_keys}")
+    print(f"    d_input = {config.d_input}  (control: {config.control_dim})")
+    print(
+        f"    Levels: {len(config.level_configs)}, "
+        f"control from level {config.control_level_idx}"
+    )
+    print(f"    imitation_loss_weight: {config.imitation_loss_weight}")
 
     env = ROSEnvironment(config_path=ENV_CONFIG_PATH, device=device)
     action_keys = [s.key for s in env.action_specs]
     model = HierarchicalPCWorldModel(config).to(device)
 
     runner = model.build_runner(
-        level_frequencies=[10, 1],
+        level_frequencies=[300, 100],
         time_scale=1.0,
         batch_size=1,
         device=device,
+        online_learning=True,
     )
 
     kb = KeyboardReader()

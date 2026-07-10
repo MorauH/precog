@@ -36,11 +36,13 @@ if TYPE_CHECKING:
 @dataclass
 class DiagnosticsConfig:
     enabled: bool = True
+    detail_level: str = "full"  # "full" | "light" (hz + action + prev only)
     report_interval_seconds: float = 2.0
     window_ticks: int = 600
+    stats_interval: int = 10  # compute expensive stats every N ticks
     compute_grad_norms: bool = True
     compute_param_norms: bool = True
-    compute_ema_alignment: bool = True  # MSE(online, target) SSM output
+    compute_ema_alignment: bool = True
     log_to_csv: bool = False
     csv_path: str = "diagnostics.csv"
 
@@ -53,6 +55,7 @@ class DiagnosticsConfig:
 @dataclass
 class _LevelAccumulator:
     updates: int = 0  # ticks this level updated in window
+    expensive_samples: int = 0  # ticks with grad/param/ema data
     surprise_sum: float = 0.0
     surprise_min: float = float("inf")
     surprise_max: float = float("-inf")
@@ -64,8 +67,8 @@ class _LevelAccumulator:
     h_norm_sum: float = 0.0
     alpha_last: float = 0.0
     grad_norm_sum: float = 0.0
-    grad_norm_max: float = 0.0
-    param_norm: float = 0.0
+    grad_norm_max: float = -1.0
+    param_norm_sum: float = 0.0
     ema_align_sum: float = 0.0
 
 
@@ -88,6 +91,7 @@ class DiagnosticsCollector:
 
         self._total_ticks = 0
         self._window_ticks = 0
+        self._stats_counter = 0  # for periodic expensive stats
         self._proc_time_sum = 0.0
         self._proc_time_max = 0.0
         self._window_start_wall = time.monotonic()
@@ -139,11 +143,17 @@ class DiagnosticsCollector:
 
         self._total_ticks += 1
         self._window_ticks += 1
+        self._stats_counter += 1
+
+        do_expensive = self._stats_counter % self.cfg.stats_interval == 0
 
         if process_time is not None:
             self._proc_time_sum += process_time
             if process_time > self._proc_time_max:
                 self._proc_time_max = process_time
+
+        if self.cfg.detail_level == "light":
+            return
 
         for i in result.updated_levels:
             level = self.model.levels[i]
@@ -181,26 +191,25 @@ class DiagnosticsCollector:
             # -- error correction alpha --------------------------------------
             acc.alpha_last = float(torch.tanh(level.alpha).item())
 
-            # -- gradient norms (captured before the next zero_grad) ---------
-            if self.cfg.compute_grad_norms:
-                g_norm = _total_grad_norm(level)
-                acc.grad_norm_sum += g_norm
-                acc.grad_norm_max = max(acc.grad_norm_max, g_norm)
+            # -- expensive stats (periodic) ----------------------------------
+            if do_expensive:
+                acc.expensive_samples += 1
 
-                if hasattr(self.model, "control_head"):
-                    g_ctrl = _total_grad_norm(self.model.control_head)
-                    if i == self.model.control_level_idx:
-                        acc.grad_norm_sum += g_ctrl
+                if self.cfg.compute_grad_norms:
+                    g_norm = _total_grad_norm(level)
+                    acc.grad_norm_sum += g_norm
+                    acc.grad_norm_max = max(acc.grad_norm_max, g_norm)
 
-            # -- parameter norms (cheap, L2 of all params) -------------------
-            if self.cfg.compute_param_norms:
-                acc.param_norm = _total_param_norm(level)
+                    if hasattr(self.model, "control_head"):
+                        g_ctrl = _total_grad_norm(self.model.control_head)
+                        if i == self.model.control_level_idx:
+                            acc.grad_norm_sum += g_ctrl
 
-            # -- EMA alignment -----------------------------------------------
-            if self.cfg.compute_ema_alignment:
-                acc.ema_align_sum += _hidden_divergence(
-                    state.hidden, state.hidden_target
-                )
+                if self.cfg.compute_param_norms:
+                    acc.param_norm_sum += _total_param_norm(level)
+
+                if self.cfg.compute_ema_alignment:
+                    acc.ema_align_sum += _param_divergence(level.ssm, level.ssm_target)
 
             # -- CSV ---------------------------------------------------------
             if self._csv_writer is not None:
@@ -219,7 +228,9 @@ class DiagnosticsCollector:
                         "grad_norm": round(acc.grad_norm_sum / acc.updates, 4)
                         if acc.updates > 0
                         else 0.0,
-                        "param_norm": round(acc.param_norm, 4),
+                        "param_norm": round(
+                            acc.param_norm_sum / max(acc.expensive_samples, 1), 4
+                        ),
                         "ema_align": round(acc.ema_align_sum / acc.updates, 4)
                         if acc.updates > 0
                         else 0.0,
@@ -232,6 +243,11 @@ class DiagnosticsCollector:
         # Trim window if needed
         if self._window_ticks > self.cfg.window_ticks:
             self._reset_window()
+
+    @property
+    def tick_rate(self) -> float:
+        elapsed = time.monotonic() - self._window_start_wall
+        return self._window_ticks / elapsed if elapsed > 0 else 0.0
 
     def should_report(self) -> bool:
         if not self.cfg.enabled:
@@ -265,6 +281,7 @@ class DiagnosticsCollector:
         self._window_start_wall = time.monotonic()
         for acc in self._levels:
             acc.updates = 0
+            acc.expensive_samples = 0
             acc.surprise_sum = 0.0
             acc.surprise_min = float("inf")
             acc.surprise_max = float("-inf")
@@ -275,7 +292,8 @@ class DiagnosticsCollector:
             acc.z_dead_sum = 0.0
             acc.h_norm_sum = 0.0
             acc.grad_norm_sum = 0.0
-            acc.grad_norm_max = 0.0
+            acc.grad_norm_max = -1.0
+            acc.param_norm_sum = 0.0
             acc.ema_align_sum = 0.0
 
     def _build_report_lines(self) -> List[str]:
@@ -324,12 +342,17 @@ class DiagnosticsCollector:
             h_norm = f"{acc.h_norm_sum / n:.2f}"
             dead = f"{acc.z_dead_sum / n * 100:.1f}%"
             alpha = f"{acc.alpha_last:+.3f}"
+            m = max(acc.expensive_samples, 1)
             grad = (
-                f"{acc.grad_norm_sum / n:.2f}"
+                f"{acc.grad_norm_sum / m:.2f}"
                 if self.cfg.compute_grad_norms
                 else "    —"
             )
-            param = f"{acc.param_norm:.2f}" if self.cfg.compute_param_norms else "    —"
+            param = (
+                f"{acc.param_norm_sum / m:.2f}"
+                if self.cfg.compute_param_norms
+                else "    —"
+            )
 
             lines.append(
                 f"  L{i:<6d} {surprise:>9s} {z_norm:>9s} {z_std:>9s} "
@@ -363,7 +386,7 @@ class DiagnosticsCollector:
             for i, acc in enumerate(self._levels):
                 if acc.updates == 0:
                     continue
-                align = acc.ema_align_sum / acc.updates
+                align = acc.ema_align_sum / max(acc.expensive_samples, 1)
                 lines.append(f"  L{i:<6d} {align:>10.4f}")
 
         lines.append("")
@@ -390,10 +413,13 @@ def _total_param_norm(module: torch.nn.Module) -> float:
     return total**0.5
 
 
-def _hidden_divergence(
-    h_online: torch.Tensor,
-    h_target: torch.Tensor,
+def _param_divergence(
+    ssm_online: torch.nn.Module,
+    ssm_target: torch.nn.Module,
 ) -> float:
-    """MSE between online and target SSM hidden states."""
+    """L2 distance between online and target SSM parameter vectors."""
     with torch.no_grad():
-        return float((h_online - h_target).pow(2).mean().item())
+        total = 0.0
+        for po, pt in zip(ssm_online.parameters(), ssm_target.parameters()):
+            total += (po - pt).pow(2).sum().item()
+        return total**0.5

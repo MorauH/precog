@@ -13,6 +13,23 @@ from .config import ModelConfig
 from .multi_rate_runner import MultiRateRunner, RunnerConfig
 
 
+def _probe_compile_backends() -> list[str]:
+    """Return a list of working torch.compile backends, best first."""
+    working: list[str] = []
+
+    @torch.compile(backend="inductor")
+    def _probe(x: torch.Tensor) -> torch.Tensor:
+        return x.matmul(x.t())
+
+    try:
+        _probe(torch.randn(4, 4))
+        working.append("inductor")
+    except Exception:
+        pass
+
+    return working
+
+
 class HierarchicalPCWorldModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -149,6 +166,33 @@ class HierarchicalPCWorldModel(nn.Module):
         }
 
     # ------------------------------------------------------------------ #
+    # TorchScript / torch.compile acceleration
+    # ------------------------------------------------------------------ #
+
+    def compile(self, mode: str = "reduce-overhead"):
+        """torch.compile all hot paths for online execution.
+
+        Call once after construction, before any ticks.
+        Tries inductor first, falls back to cudagraphs on CUDA, silently skips
+        if neither works.
+        Set ``mode="max-autotune"`` for highest throughput (one-time pause).
+        """
+        backends = _probe_compile_backends()
+        if not backends:
+            return
+
+        backend = backends[0]
+        for m in [*self.levels, self.control_head]:
+            for attr in ("step", "forward"):
+                fn = getattr(m, attr, None)
+                if fn is None:
+                    continue
+                try:
+                    setattr(m, attr, torch.compile(fn, dynamic=False, backend=backend))
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------ #
     # EMA update
     # ------------------------------------------------------------------ #
 
@@ -168,6 +212,7 @@ class HierarchicalPCWorldModel(nn.Module):
         device: str = "cpu",
         accumulate_for_upper: bool = True,
         online_learning: bool = True,
+        grad_accumulation_steps: int = 1,
     ) -> MultiRateRunner:
         if len(level_frequencies) != len(self.levels):
             raise ValueError(
@@ -181,6 +226,7 @@ class HierarchicalPCWorldModel(nn.Module):
             device=device,
             accumulate_for_upper=accumulate_for_upper,
             online_learning=online_learning,
+            grad_accumulation_steps=grad_accumulation_steps,
             imitation_loss_weight=self.config.imitation_loss_weight,
         )
         return MultiRateRunner(self, cfg)

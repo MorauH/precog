@@ -182,10 +182,11 @@ class PCLevel(nn.Module):
     @torch.no_grad()
     def update_target_ema(self, tau: float = 0.997) -> None:
         """Call after every optimizer step."""
-        for p_online, p_target in zip(
-            self.ssm.parameters(), self.ssm_target.parameters()
-        ):
-            p_target.data = tau * p_target.data + (1 - tau) * p_online.data
+        torch._foreach_lerp_(
+            list(self.ssm_target.parameters()),
+            list(self.ssm.parameters()),
+            weight=1.0 - tau,
+        )
 
     # -----------------------------------------------------------------------
     # Top-down correction (refinement pass, no SSM re-run)
@@ -313,14 +314,13 @@ class PCLevel(nn.Module):
         # ── (a) Online path — gradient-enabled ────────────────────────────
         z_raw, h_new = self.ssm.step(z_below, h)  # (batch, d_repr)
 
-        # ── (b) Target path — no gradients ────────────────────────────────
+        # ── (b) Target path — params have requires_grad=False ──────────────
         #    z_t_target is the JEPA prediction target for the *previous*
         #    timestep's z_hat_next. The training loop pairs them as:
         #        loss += MSE(z_hat_next[t-1], z_t_target[t].detach())
-        with torch.no_grad():
-            z_t_target, h_target_new = self.ssm_target.step(
-                z_below, h_target
-            )  # (batch, d_repr)
+        z_t_target, h_target_new = self.ssm_target.step(
+            z_below, h_target
+        )  # (batch, d_repr)
 
         # ── (c) Top-down PC error correction — online path only ───────────
         #    ε_above = z_raw - pred_from_above  (surprise at this level)

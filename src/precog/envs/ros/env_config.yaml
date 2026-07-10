@@ -134,10 +134,10 @@ actions:
     msg_type: std_msgs/msg/Float32
     codec: float
 
-  - key: acceleration
-    topic: /cmd/acc
-    msg_type: std_msgs/msg/Float32
-    codec: float
+  #- key: acceleration
+  #  topic: /cmd/acc
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
 
 # Action topics mirrored as observations, so the model can read the expert's
 # commands in IMITATE mode.  Not required — only populated when the expert is
@@ -151,10 +151,10 @@ expert_action_observations:
     max_age_sec: 0.5
     required: false
 
-  - key: expert_acceleration
-    topic: /cmd/acc
-    msg_type: std_msgs/msg/Float32
-    codec: float
-    shape: [1, 1]
-    max_age_sec: 0.5
-    required: false
+  #- key: expert_acceleration
+  #  topic: /cmd/acc
+  #  msg_type: std_msgs/msg/Float32
+  #  codec: float
+  #  shape: [1, 1]
+  #  max_age_sec: 0.5
+  #  required: false

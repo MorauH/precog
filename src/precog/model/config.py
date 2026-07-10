@@ -22,7 +22,7 @@ class PCLevelConfig:
 @dataclass
 class ControlHeadConfig:
     hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
-    output_dim: int = 2
+    output_dim: int = 1
 
 
 @dataclass
@@ -90,9 +90,9 @@ DEFAULT_CONFIG = ModelConfig(
     observation_keys=[
         "current_steering",
         "best_path_relative_sampling",
-        "car_pose",
+        # "car_pose",
     ],
-    control_dim=2,
+    control_dim=1,
     d_input=0,  # resolved at runtime from env shapes
     level_configs=[
         PCLevelConfig(
@@ -108,6 +108,6 @@ DEFAULT_CONFIG = ModelConfig(
             forward_head_hidden=[16],
         ),
     ],
-    control_head=ControlHeadConfig(hidden_dims=[16, 8], output_dim=2),
+    control_head=ControlHeadConfig(hidden_dims=[16, 8], output_dim=1),
     control_level_idx=1,
 )

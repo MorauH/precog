@@ -82,7 +82,7 @@ def _action_from_obs(
 def main():
     rclpy.init()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"
     print(f"Device: {device}")
 
     with open(ENV_CONFIG_PATH) as f:
@@ -101,9 +101,11 @@ def main():
     env = ROSEnvironment(config_path=ENV_CONFIG_PATH, device=device)
     action_keys = [s.key for s in env.action_specs]
     model = HierarchicalPCWorldModel(config).to(device)
+    model.compile(mode="reduce-overhead")
 
     diag_cfg = DiagnosticsConfig(
         enabled=True,
+        detail_level="light",
         report_interval_seconds=2.0,
         compute_grad_norms=True,
         compute_param_norms=True,
@@ -112,11 +114,12 @@ def main():
     diagnostics = DiagnosticsCollector(model, diag_cfg)
 
     runner = model.build_runner(
-        level_frequencies=[1000, 100],
+        level_frequencies=[200, 100],
         time_scale=1.0,
         batch_size=1,
         device=device,
         online_learning=True,
+        grad_accumulation_steps=3,
     )
 
     kb = KeyboardReader()
@@ -156,17 +159,33 @@ def main():
 
             tick_count += 1
 
-            if diagnostics.should_report():
+            if diagnostics.cfg.detail_level == "light":
+                if tick_count % 200 == 0:
+                    hz = diagnostics.tick_rate
+                    ma = result.action[0].tolist()
+                    pa = (
+                        prev_action[0].tolist()
+                        if prev_action is not None
+                        else [float("nan")] * len(action_keys)
+                    )
+                    model_str = ", ".join(f"{v:.4f}" for v in ma)
+                    prev_str = ", ".join(f"{v:.4f}" for v in pa)
+                    print(
+                        f"\n  tick={tick_count}  hz={hz:5.1f}  mode={mode.name}  "
+                        f"model=[{model_str}]  prev=[{prev_str}]"
+                    )
+            elif diagnostics.should_report():
                 ma = result.action[0].tolist()
                 pa = (
                     prev_action[0].tolist()
                     if prev_action is not None
-                    else [float("nan"), float("nan")]
+                    else [float("nan")] * len(action_keys)
                 )
+                model_str = ", ".join(f"{v:.4f}" for v in ma)
+                prev_str = ", ".join(f"{v:.4f}" for v in pa)
                 print(
                     f"\n  tick={tick_count}  mode={mode.name}  "
-                    f"model=[{ma[0]:.4f}, {ma[1]:.4f}]  "
-                    f"prev=[{pa[0]:.4f}, {pa[1]:.4f}]"
+                    f"model=[{model_str}]  prev=[{prev_str}]"
                 )
                 print(diagnostics.report(), flush=True)
 

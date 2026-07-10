@@ -62,11 +62,12 @@ class SelectiveSSM(nn.Module):
 
         # ------------------------------------------------------------------
         # State matrix A — diagonal, log-parameterized
-        # Initialized with HiPPO-inspired spacing: log(1), log(2), ..., log(N)
-        # gives good coverage of timescales from the start.
+        # Initialized so |A| spans [5, 5*N] giving A_bar in [0.5, 0.995]
+        # across the delta range.  Five-fold upscale prevents unbounded
+        # state growth seen with the standard [1, N] range.
         # ------------------------------------------------------------------
         self.A_log = nn.Parameter(
-            torch.log(torch.arange(1, config.d_state + 1, dtype=torch.float32))
+            torch.log(torch.arange(1, config.d_state + 1, dtype=torch.float32) * 5)
         )
 
         # ------------------------------------------------------------------
@@ -111,10 +112,15 @@ class SelectiveSSM(nn.Module):
         """Return zero-initialised hidden state. (batch, d_state)"""
         return torch.zeros(batch_size, self.d_state, device=device)
 
+    @property
+    def A(self) -> torch.Tensor:
+        """Diagonal stable state matrix (negative real)."""
+        return -torch.exp(self.A_log)
+
     def step(
         self,
-        x: torch.Tensor,       # (batch, d_input)
-        h: torch.Tensor,       # (batch, d_state)
+        x: torch.Tensor,  # (batch, d_input)
+        h: torch.Tensor,  # (batch, d_state)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Process a single timestep. Used during online inference and
@@ -124,32 +130,24 @@ class SelectiveSSM(nn.Module):
             y:     Output representation  (batch, d_output)
             h_new: Updated hidden state   (batch, d_state)
         """
-        x = self.in_proj(x)                                     # (batch, d_input)
+        x = self.in_proj(x)  # (batch, d_input)
 
-        # Stable state matrix: negative real part ensures decay
-        A = -torch.exp(self.A_log)                              # (d_state,)
+        delta = F.softplus(self.delta_proj(x))  # (batch, d_state)
+        A_bar = torch.exp(delta * self.A).clamp(max=0.99)  # (batch, d_state)
+        B_bar = delta * self.B_proj(x)  # (batch, d_state)
 
-        # Input-dependent timescale — always positive
-        delta = F.softplus(self.delta_proj(x))                  # (batch, d_state)
+        h_new = A_bar * h + B_bar  # (batch, d_state)
 
-        # ZOH discretization
-        A_bar = torch.exp(delta * A.unsqueeze(0))               # (batch, d_state)
-        B_bar = delta * self.B_proj(x)                          # (batch, d_state)
-
-        # State update — element-wise because A is diagonal
-        h_new = A_bar * h + B_bar                               # (batch, d_state)
-
-        # Read from state — element-wise contraction then sum
-        C = self.C_proj(x)                                      # (batch, d_state)
-        y = self.out_proj(C * h_new)                            # (batch, d_output)
+        C = self.C_proj(x)  # (batch, d_state)
+        y = self.out_proj(C * h_new)  # (batch, d_output)
         y = self.norm(y)
 
         return y, h_new
 
     def forward(
         self,
-        x_seq: torch.Tensor,                        # (batch, seq_len, d_input)
-        h0: Optional[torch.Tensor] = None,          # (batch, d_state)
+        x_seq: torch.Tensor,  # (batch, seq_len, d_input)
+        h0: Optional[torch.Tensor] = None,  # (batch, d_state)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Process a full sequence. Used during offline pre-training on

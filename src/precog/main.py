@@ -102,7 +102,7 @@ def main():
     model = HierarchicalPCWorldModel(config).to(device)
 
     runner = model.build_runner(
-        level_frequencies=[100, 10, 1],
+        level_frequencies=[10, 1],
         time_scale=1.0,
         batch_size=1,
         device=device,

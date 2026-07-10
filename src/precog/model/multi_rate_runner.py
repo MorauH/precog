@@ -65,6 +65,12 @@ class RunnerConfig:
         detail across the hierarchy.
         If False, only the most recent level-i output is used (simpler but
         loses within-window dynamics at higher levels).
+    learning_rate:
+        Per-level Adam learning rate for online local-PC learning.
+        Each level has its own optimizer. Set to 0.0 to disable learning.
+    ema_tau:
+        EMA decay for target SSM updates (JEPA stabilisation).
+        Called after each optimizer.step() per level.
     """
 
     level_frequencies: List[float]
@@ -72,6 +78,8 @@ class RunnerConfig:
     batch_size: int = 1
     device: str = "cpu"
     accumulate_for_upper: bool = True
+    learning_rate: float = 1e-3
+    ema_tau: float = 0.997
 
 
 @dataclass
@@ -101,6 +109,13 @@ class TickResult:
 
 class MultiRateRunner:
     """Multi-frequency execution wrapper for HierarchicalPCWorldModel.
+
+    Online local-PC learning
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    Each level learns independently: when a level fires, its own prediction
+    error ε = z_below.detach() - predict_downward(z) is used as a local loss.
+    Gradients do not cross levels — this is the biologically-motivated
+    Rao & Ballard formulation, not end-to-end backprop.
 
     Parameters
     ----------
@@ -139,6 +154,13 @@ class MultiRateRunner:
         self._accum_buffers: List[List[torch.Tensor]] = [
             [] for _ in runner_cfg.level_frequencies
         ]
+
+        # Per-level optimisers (local-PC: each level learns from its own ε)
+        self._optimizers: List[torch.optim.Optimizer] = []
+        self._lr = runner_cfg.learning_rate
+        self._ema_tau = runner_cfg.ema_tau
+        for level in self.model.levels:
+            self._optimizers.append(torch.optim.Adam(level.parameters(), lr=self._lr))
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -191,8 +213,10 @@ class MultiRateRunner:
         for i, level in enumerate(self.model.levels):
             state = self._level_states[i]
 
-            # Accumulate level-i input for level i+1
-            # (store the current z_input last-frame for upper consumption)
+            # Accumulate detached copy of z_input for level i+1's future
+            # consumption.  Detached — local PC does not backprop between
+            # levels.  The current (gradient-enabled) z_input is preserved
+            # for level i's own forward pass below.
             self._accum_buffers[i].append(z_input[:, -1].detach())  # (B, d)
 
             if not self.clock.should_update(i):
@@ -203,10 +227,19 @@ class MultiRateRunner:
 
             updated_levels.append(i)
 
-            # Build the sequence input for this level
-            seq = self._pop_sequence_for_level(i, z_input)  # (B, T, d)
+            # Build the sequence input for this level.
+            # Level 0 uses the current (gradient-enabled) encoder output
+            # directly so modality encoders receive gradients from ε₀.
+            # Higher levels use accumulated, detached buffers from below.
+            if i == 0:
+                seq = z_input  # (B, 1, d_level0) — gradients flow
+                self._accum_buffers[0] = []
+            else:
+                seq = self._pop_sequence_for_level(i, z_input)  # (B, T, d)
 
-            # Downward prediction from level above — compute from held z
+            # Downward prediction from level above — compute from held z.
+            # no_grad: local PC does not train predict_downward from below's loss.
+            # predict_downward gets trained when its own level fires.
             pred_from_above: Optional[torch.Tensor] = None
             if i + 1 < len(self._level_states):
                 above_state = self._level_states[i + 1]
@@ -219,29 +252,42 @@ class MultiRateRunner:
                     T = seq.shape[1]
                     pred_from_above = pfa.unsqueeze(1).expand(-1, T, -1)  # (B, T, d)
 
+            # Detach incoming hidden states to bound the graph to this tick.
+            # Each tick is a clean forward → backward → step cycle.
+            h_in = state.hidden.detach()
+            h_target_in = state.hidden_target.detach()
+
             # Forward through this level
-            z_seq, _, z_hat_next_seq, _, h_new, h_target_new, epsilon = level.forward(
-                seq,
-                state.hidden,
-                state.hidden_target,
-                pred_from_above,
+            z_seq, z_target_seq, z_hat_next_seq, _, h_new, h_target_new, epsilon = (
+                level.forward(seq, h_in, h_target_in, pred_from_above)
             )
 
-            # Update LevelState
+            # Local PC learning: backprop ε² independently at this level.
+            # No gradients cross level boundaries — each level learns from
+            # its own prediction error only.
+            surprise_i = epsilon.pow(2).mean()
+            surprise_terms.append(surprise_i.detach())
+
+            if self._lr > 0:
+                self._optimizers[i].zero_grad()
+                surprise_i.backward()
+                self._optimizers[i].step()
+                if hasattr(level, "update_target_ema"):
+                    level.update_target_ema(self._ema_tau)
+
+            # Store detached outputs — no gradient leaks into future ticks.
             state.update(
-                hidden=h_new[:, -1],
-                hidden_target=h_target_new[:, -1],
-                z=z_seq[:, -1],
-                z_hat_next=z_hat_next_seq[:, -1],
-                pred_error=epsilon,
+                hidden=h_new[:, -1].detach(),
+                hidden_target=h_target_new[:, -1].detach(),
+                z=z_seq[:, -1].detach(),
+                z_hat_next=z_hat_next_seq[:, -1].detach(),
+                pred_error=epsilon.detach(),
                 tick=current_tick,
                 sim_time=sim_time,
             )
 
-            surprise_terms.append(epsilon.pow(2).mean())
-
-            # Prepare z_input for the level above
-            z_input = z_seq  # (B, T, d_repr_i)
+            # Prepare z_input for the level above (detached — local PC boundary).
+            z_input = z_seq.detach()  # (B, T, d_repr_i)
 
         if surprise_terms:
             total_surprise = torch.stack(surprise_terms).sum()

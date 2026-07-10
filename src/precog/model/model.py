@@ -235,7 +235,7 @@ class HierarchicalPCWorldModel(nn.Module):
     def update_ema(self, tau: float = 0.997):
         """Update all target encoders (call after optimizer.step())."""
         for level in self.levels:
-            level.update_ema(tau)
+            level.update_target_ema(tau)
 
     # ------------------------------------------------------------------ #
     # Multi-rate runner factory

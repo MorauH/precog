@@ -11,6 +11,8 @@ dependencies = [
     "numpy",
     "mcap",
     "mcap-ros2-support",
+    "fastapi",
+    "uvicorn[standard]",
 ]
 
 # Define hardware targets as extras

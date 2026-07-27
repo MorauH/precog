@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>precog dashboard</title>
+<style>
+:root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149; --yellow: #d2991d; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+h1 { font-size: 20px; margin-bottom: 16px; color: var(--accent); }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+.row { display: flex; gap: 16px; flex-wrap: wrap; }
+.col { flex: 1; min-width: 280px; }
+.label { font-size: 11px; text-transform: uppercase; color: var(--dim); letter-spacing: 0.5px; margin-bottom: 4px; }
+.value { font-size: 20px; font-weight: 600; }
+.mono { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 14px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+button { background: var(--border); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
+button:hover { border-color: var(--accent); }
+button.active { background: var(--accent); color: #000; }
+canvas { width: 100%; height: 240px; }
+#status { margin-top: 8px; color: var(--green); font-size: 13px; }
+#status.disconnected { color: var(--red); }
+.stale { color: var(--yellow); }
+.blend-group { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+.blend-group .label { min-width: 50px; margin-bottom: 0; }
+.blend-group span.mono { min-width: 80px; text-align: right; }
+</style>
+</head>
+<body>
+<h1>precog dashboard</h1>
+
+<div class="card">
+  <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
+    <span class="label" style="margin-bottom:0">Mode:</span>
+    <button id="btn_imitate" class="active">IMITATE</button>
+    <button id="btn_drive">DRIVE</button>
+  </div>
+  <div class="blend-group">
+    <span class="label">Steer blend</span>
+    <input type="range" id="blend_steer" min="0" max="100" value="0" step="1">
+    <span class="mono" id="blend_steer_label">0%</span>
+  </div>
+  <div class="blend-group">
+    <span class="label">Acc blend</span>
+    <input type="range" id="blend_acc" min="0" max="100" value="0" step="1">
+    <span class="mono" id="blend_acc_label">0%</span>
+  </div>
+  <div style="font-size:12px;color:var(--dim);margin-top:4px">0% = auto, 100% = precog (blend only active in DRIVE mode)</div>
+  <div id="status">connecting...</div>
+</div>
+
+<div class="row">
+  <div class="col">
+    <div class="card">
+      <div class="label">Steering</div>
+      <canvas id="chart_steer"></canvas>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <div class="label">Acceleration</div>
+      <canvas id="chart_acc"></canvas>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="label">Surprise</div>
+  <canvas id="chart_surprise"></canvas>
+</div>
+
+<div class="card">
+  <div class="label">Metrics</div>
+  <div class="grid">
+    <div><div class="label">Tick rate</div><div class="value mono" id="m_hz">--</div></div>
+    <div><div class="label">Tick count</div><div class="value mono" id="m_tick">--</div></div>
+    <div><div class="label">Mode</div><div class="value mono" id="m_mode">--</div></div>
+    <div><div class="label">Blend steer</div><div class="value mono" id="m_blend_s">--</div></div>
+    <div><div class="label">Blend acc</div><div class="value mono" id="m_blend_a">--</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="label">Source Selector</div>
+  <div class="grid">
+    <div><div class="label">Auto steer</div><div class="value mono" id="ss_auto_s">--</div></div>
+    <div><div class="label">Auto acc</div><div class="value mono" id="ss_auto_a">--</div></div>
+    <div><div class="label">Precog steer</div><div class="value mono" id="ss_prec_s">--</div></div>
+    <div><div class="label">Precog acc</div><div class="value mono" id="ss_prec_a">--</div></div>
+    <div><div class="label">Stale</div><div class="value mono stale" id="ss_stale">--</div></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script>
+const MAX_POINTS = 300;
+
+function makeChartData(ds1Label, ds1Color, ds2Label, ds2Color) {
+  return { labels: [], datasets: [
+    { label: ds1Label, borderColor: ds1Color, data: [], tension: 0.1, pointRadius: 0 },
+    { label: ds2Label, borderColor: ds2Color, data: [], tension: 0.1, pointRadius: 0, borderDash: [4, 2] },
+  ]};
+}
+
+const steerData = makeChartData('model steer', '#58a6ff', 'expert steer', '#8b949e');
+const accData   = makeChartData('model acc', '#3fb950', 'expert acc', '#6e7681');
+const surpriseData = { labels: [], datasets: [
+  { label: 'L0', borderColor: '#58a6ff', data: [], tension: 0.1, pointRadius: 0 },
+  { label: 'L1', borderColor: '#d2991d', data: [], tension: 0.1, pointRadius: 0 },
+]};
+
+function makeChart(id, data, yLabel) {
+  const ctx = document.getElementById(id).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line', data,
+    options: {
+      responsive: true, animation: false,
+      scales: { x: { display: false }, y: { title: { display: true, text: yLabel, color: '#8b949e' }, ticks: { color: '#8b949e' }, grid: { color: '#21262d' } } },
+      plugins: { legend: { labels: { color: '#8b949e', usePointStyle: true, boxWidth: 8 } } }
+    }
+  });
+}
+
+let chartSteer = makeChart('chart_steer', steerData, 'Steer');
+let chartAcc = makeChart('chart_acc', accData, 'Acc');
+let chartSurprise = makeChart('chart_surprise', surpriseData, 'Surprise');
+
+const statusEl = document.getElementById('status');
+const blendSteerSlider = document.getElementById('blend_steer');
+const blendAccSlider = document.getElementById('blend_acc');
+const blendSteerLabel = document.getElementById('blend_steer_label');
+const blendAccLabel = document.getElementById('blend_acc_label');
+const btnImitate = document.getElementById('btn_imitate');
+const btnDrive = document.getElementById('btn_drive');
+let currentMode = 'IMITATE';
+
+function vals(dp) { return Array.isArray(dp) ? dp : [dp, 0]; }
+
+function makeBlendHandler(slider, label, cmdKey) {
+  slider.addEventListener('input', () => {
+    if (currentMode !== 'DRIVE') {
+      slider.value = 0;
+      label.textContent = '0% (IMITATE)';
+      return;
+    }
+    const v = parseInt(slider.value) / 100;
+    label.textContent = Math.round(v * 100) + '%';
+    const cmd = {}; cmd[cmdKey] = v;
+    send(cmd);
+  });
+}
+
+makeBlendHandler(blendSteerSlider, blendSteerLabel, 'set_blend_steer');
+makeBlendHandler(blendAccSlider, blendAccLabel, 'set_blend_acc');
+
+btnImitate.addEventListener('click', () => send({ set_mode: 'IMITATE' }));
+btnDrive.addEventListener('click', () => send({ set_mode: 'DRIVE' }));
+
+let lastBlendSteer = 0;
+let lastBlendAcc = 0;
+function updateModeUI(mode) {
+  currentMode = mode;
+  btnImitate.className = mode === 'IMITATE' ? 'active' : '';
+  btnDrive.className = mode === 'DRIVE' ? 'active' : '';
+  if (mode === 'IMITATE') {
+    lastBlendSteer = parseInt(blendSteerSlider.value) / 100;
+    lastBlendAcc = parseInt(blendAccSlider.value) / 100;
+    blendSteerSlider.value = 0;
+    blendAccSlider.value = 0;
+    [blendSteerSlider, blendAccSlider].forEach(s => s.style.opacity = '0.4');
+    blendSteerLabel.textContent = '0% (auto only)';
+    blendAccLabel.textContent = '0% (auto only)';
+  } else {
+    blendSteerSlider.value = Math.round(lastBlendSteer * 100);
+    blendAccSlider.value = Math.round(lastBlendAcc * 100);
+    [blendSteerSlider, blendAccSlider].forEach(s => s.style.opacity = '');
+    blendSteerLabel.textContent = Math.round(lastBlendSteer * 100) + '%';
+    blendAccLabel.textContent = Math.round(lastBlendAcc * 100) + '%';
+  }
+}
+
+let ws;
+
+function send(cmd) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(cmd));
+  }
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  ws.onopen = () => { statusEl.textContent = 'connected'; statusEl.className = ''; };
+  ws.onclose = () => { statusEl.textContent = 'disconnected — reconnecting...'; statusEl.className = 'disconnected'; setTimeout(connect, 1000); };
+  ws.onmessage = (ev) => { try { updateUI(JSON.parse(ev.data)); } catch(e) {} };
+}
+
+function pushData(chart, dataArr, ds0, ds1) {
+  dataArr.labels.push(dataArr.labels.length);
+  dataArr.datasets[0].data.push(ds0);
+  dataArr.datasets[1].data.push(ds1);
+  while (dataArr.labels.length > MAX_POINTS) {
+    dataArr.labels.shift();
+    dataArr.datasets.forEach(d => d.data.shift());
+  }
+  chart.update();
+}
+
+function updateUI(d) {
+  if (currentMode === 'DRIVE') {
+    if (d.blend_ratio_steer !== undefined) {
+      const pct = Math.round(d.blend_ratio_steer * 100);
+      blendSteerSlider.value = pct;
+      blendSteerLabel.textContent = pct + '%';
+    }
+    if (d.blend_ratio_acc !== undefined) {
+      const pct = Math.round(d.blend_ratio_acc * 100);
+      blendAccSlider.value = pct;
+      blendAccLabel.textContent = pct + '%';
+    }
+  }
+  if (d.mode) updateModeUI(d.mode);
+  if (d.tick_rate !== undefined) document.getElementById('m_hz').textContent = d.tick_rate.toFixed(1) + ' Hz';
+  if (d.tick !== undefined) document.getElementById('m_tick').textContent = d.tick;
+  if (d.mode) document.getElementById('m_mode').textContent = d.mode;
+  if (d.blend_ratio_steer !== undefined) document.getElementById('m_blend_s').textContent = Math.round(d.blend_ratio_steer * 100) + '%';
+  if (d.blend_ratio_acc !== undefined) document.getElementById('m_blend_a').textContent = Math.round(d.blend_ratio_acc * 100) + '%';
+
+  if (d.source_selector) {
+    const ss = d.source_selector;
+    const fmt = function(v) {
+      if (v === null || v === undefined) return '--';
+      return (typeof v === 'number') ? v.toFixed(4) : String(v);
+    };
+    document.getElementById('ss_auto_s').textContent = fmt(ss.auto_steer);
+    document.getElementById('ss_auto_a').textContent = fmt(ss.auto_acc);
+    document.getElementById('ss_prec_s').textContent = fmt(ss.precog_steer);
+    document.getElementById('ss_prec_a').textContent = fmt(ss.precog_acc);
+    const staleVal = ss.stale;
+    document.getElementById('ss_stale').textContent = (staleVal && staleVal.length) ? staleVal.join(', ') : 'none';
+  }
+
+  if (d.action !== undefined || d.prev_action !== undefined) {
+    const [ms, ma] = vals(d.action);
+    const [ps, pa] = vals(d.prev_action);
+    pushData(chartSteer, steerData, ms, ps);
+    pushData(chartAcc, accData, ma, pa);
+  }
+
+  if (d.surprise !== undefined) {
+    surpriseData.labels.push(surpriseData.labels.length);
+    const s = d.surprise;
+    surpriseData.datasets[0].data.push(s[0] !== undefined ? s[0] : null);
+    surpriseData.datasets[1].data.push(s[1] !== undefined ? s[1] : null);
+    while (surpriseData.labels.length > MAX_POINTS) {
+      surpriseData.labels.shift();
+      surpriseData.datasets.forEach(d => d.data.shift());
+    }
+    chartSurprise.update();
+  }
+}
+
+connect();
+</script>
+</body>
+</html>

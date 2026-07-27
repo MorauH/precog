@@ -84,6 +84,9 @@ class MultiRateRunner:
     ) -> TickResult:
         t_start = time.monotonic() if diagnostics is not None else 0.0
 
+        if prev_action is not None:
+            prev_action = prev_action.detach()
+
         self.clock.tick()
         current_tick = self.clock._tick_count
         sim_time = self.clock.sim_time()

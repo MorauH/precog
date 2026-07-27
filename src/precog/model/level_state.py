@@ -14,7 +14,7 @@ Separating state from the nn.Module means:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -22,69 +22,36 @@ import torch
 
 @dataclass
 class LevelState:
-    """All mutable state for one PCLevel during online execution.
+    """All mutable state for one PCLevel during online execution."""
 
-    Parameters
-    ----------
-    level_idx:
-        Which level this belongs to (0 = lowest / fastest).
-    hidden:
-        SSM hidden state, shape (B, d_state).
-    last_z:
-        Most-recently-produced representation, shape (B, d_repr).
-        Held constant between updates (zero-order hold).
-    last_z_hat_next:
-        Most-recently-predicted next representation, shape (B, d_repr).
-        Also held constant.
-    last_pred_error:
-        Scalar prediction-error tensor from the last update (for logging).
-    last_update_tick:
-        Base-clock tick index when this level last ran.
-    last_update_sim_time:
-        Simulated time (seconds) when this level last ran.
-    """
     level_idx: int
 
-    # Hidden state
     hidden: torch.Tensor                      # (B, d_state)
 
-    # Cached outputs (zero-order hold between updates)
     last_z: Optional[torch.Tensor] = None          # (B, d_repr)
-    last_z_hat_next: Optional[torch.Tensor] = None  # (B, d_repr)
     last_pred_error: Optional[torch.Tensor] = None
 
-    # Bookkeeping
     last_update_tick: int = 0
     last_update_sim_time: float = 0.0
-
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
 
     def update(
         self,
         hidden: torch.Tensor,
         z: torch.Tensor,
-        z_hat_next: torch.Tensor,
         pred_error: torch.Tensor,
         tick: int,
         sim_time: float,
     ):
-        """Atomically update all fields after a forward pass."""
         self.hidden = hidden
         self.last_z = z
-        self.last_z_hat_next = z_hat_next
         self.last_pred_error = pred_error
         self.last_update_tick = tick
         self.last_update_sim_time = sim_time
 
     def detach_(self):
-        """Detach all tensors in-place (call between episodes or gradient steps)."""
         self.hidden = self.hidden.detach()
         if self.last_z is not None:
             self.last_z = self.last_z.detach()
-        if self.last_z_hat_next is not None:
-            self.last_z_hat_next = self.last_z_hat_next.detach()
 
     @classmethod
     def init(
@@ -96,12 +63,10 @@ class LevelState:
         device: torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.float32,
     ) -> "LevelState":
-        """Create a zero-initialised LevelState."""
         return cls(
             level_idx=level_idx,
             hidden=torch.zeros(batch_size, d_state, device=device, dtype=dtype),
             last_z=torch.zeros(batch_size, d_repr, device=device, dtype=dtype),
-            last_z_hat_next=torch.zeros(batch_size, d_repr, device=device, dtype=dtype),
         )
 
     def __repr__(self) -> str:

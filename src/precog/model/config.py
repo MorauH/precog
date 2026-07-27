@@ -16,7 +16,6 @@ class PCLevelConfig:
     d_representation: int
     ssm: SSMConfig
     prediction_head_hidden: List[int] = field(default_factory=lambda: [64])
-    forward_head_hidden: List[int] = field(default_factory=lambda: [64])
     sigreg_tau: float = 0.999
     sigreg_var_threshold: float = 0.1
 
@@ -101,13 +100,11 @@ DEFAULT_CONFIG = ModelConfig(
             d_representation=32,
             ssm=SSMConfig(d_state=16, dt_min=0.001, dt_max=0.01),
             prediction_head_hidden=[16],
-            forward_head_hidden=[16],
         ),
         PCLevelConfig(
             d_representation=32,
             ssm=SSMConfig(d_state=16, dt_min=0.01, dt_max=0.1),
             prediction_head_hidden=[16],
-            forward_head_hidden=[16],
         ),
     ],
     control_head=ControlHeadConfig(hidden_dims=[16, 8], output_dim=2),

@@ -5,8 +5,6 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 
-from .fnn import FNN
-from .ssm import SelectiveSSM
 from .pc_level_jepa import PCLevel
 from .control_head import ControlHead
 from .config import ModelConfig
@@ -14,7 +12,6 @@ from .multi_rate_runner import MultiRateRunner, RunnerConfig
 
 
 def _probe_compile_backends() -> list[str]:
-    """Return a list of working torch.compile backends, best first."""
     working: list[str] = []
 
     @torch.compile(backend="inductor")
@@ -51,9 +48,7 @@ class HierarchicalPCWorldModel(nn.Module):
             prev_dim = level_cfg.d_representation
 
         ctrl_cfg = config.control_head
-        control_input_dim = (
-            config.level_configs[config.control_level_idx].d_representation * 2
-        )
+        control_input_dim = config.level_configs[config.control_level_idx].d_representation
 
         self.control_head = ControlHead(
             input_dim=control_input_dim,
@@ -105,7 +100,6 @@ class HierarchicalPCWorldModel(nn.Module):
         # ---------------------------------------------------------------- #
         z_below_inputs: List[torch.Tensor] = []
         z_levels_raw: List[torch.Tensor] = []
-        z_hat_next_list: List[torch.Tensor] = []
         pred_below_list: List[torch.Tensor] = []
         prediction_errors: List[torch.Tensor] = []
         h_new_list: List[torch.Tensor] = []
@@ -114,12 +108,11 @@ class HierarchicalPCWorldModel(nn.Module):
         curr = z_level
         for i, level in enumerate(self.levels):
             z_below_inputs.append(curr)
-            z_seq, z_hat_next_seq, pred_below_seq, h_new, epsilon, sigreg_loss = (
-                level.forward(curr, hidden_states[i], None)
+            z_seq, pred_below_seq, h_new, epsilon, sigreg_loss = level.forward(
+                curr, hidden_states[i], None
             )
             h_new_list.append(h_new)
             z_levels_raw.append(z_seq)
-            z_hat_next_list.append(z_hat_next_seq)
             pred_below_list.append(pred_below_seq)
             prediction_errors.append(epsilon)
             sigreg_losses.append(sigreg_loss)
@@ -131,20 +124,18 @@ class HierarchicalPCWorldModel(nn.Module):
         level_outputs = list(z_levels_raw)
         for i in range(len(self.levels) - 2, -1, -1):
             pred_from_above_seq = pred_below_list[i + 1]
-            z_corr, z_hat_corr, pred_below_corr, eps_corr = self.levels[
+            z_corr, pred_below_corr, eps_corr = self.levels[
                 i
             ].apply_top_down_correction(
                 z_levels_raw[i], z_below_inputs[i], pred_from_above_seq
             )
             level_outputs[i] = z_corr
-            z_hat_next_list[i] = z_hat_corr
             pred_below_list[i] = pred_below_corr
             prediction_errors[i] = eps_corr
 
         ctrl_idx = self.control_level_idx
         z_ctrl = level_outputs[ctrl_idx]
-        z_hat_ctrl = z_hat_next_list[ctrl_idx]
-        action_pred = self.control_head(torch.cat([z_ctrl, z_hat_ctrl], dim=-1))
+        action_pred = self.control_head(z_ctrl)
 
         if not return_all:
             return action_pred
@@ -152,7 +143,6 @@ class HierarchicalPCWorldModel(nn.Module):
         return {
             "action_pred": action_pred,
             "z_levels": level_outputs,
-            "z_hat_next": z_hat_next_list,
             "prediction_errors": prediction_errors,
             "total_surprise": sum(e.pow(2).mean() for e in prediction_errors),
             "hidden_states": h_new_list,
@@ -164,13 +154,6 @@ class HierarchicalPCWorldModel(nn.Module):
     # ------------------------------------------------------------------ #
 
     def compile(self, mode: str = "reduce-overhead"):
-        """torch.compile all hot paths for online execution.
-
-        Call once after construction, before any ticks.
-        Tries inductor first, falls back to cudagraphs on CUDA, silently skips
-        if neither works.
-        Set ``mode="max-autotune"`` for highest throughput (one-time pause).
-        """
         backends = _probe_compile_backends()
         if not backends:
             return

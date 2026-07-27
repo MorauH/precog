@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -90,16 +90,15 @@ class MultiRateRunner:
         total_surprise: Optional[torch.Tensor] = None
         action: Optional[torch.Tensor] = None
 
-        z_level0 = self._encode_level0(obs_dict, prev_action)  # (B, d_input)
-
-        z_input = z_level0.unsqueeze(1)  # (B, 1, d_input)
+        z_level0 = self._encode_level0(obs_dict, prev_action)
+        z_input = z_level0.unsqueeze(1)
 
         surprise_terms: List[torch.Tensor] = []
 
         for i, level in enumerate(self.model.levels):
             state = self._level_states[i]
 
-            self._accum_buffers[i].append(z_input[:, -1].detach())  # (B, d)
+            self._accum_buffers[i].append(z_input[:, -1].detach())
 
             if not self.clock.should_update(i):
                 if state.last_z is not None:
@@ -109,10 +108,10 @@ class MultiRateRunner:
             updated_levels.append(i)
 
             if i == 0:
-                seq = z_input  # (B, 1, d_input) — gradients flow
+                seq = z_input
                 self._accum_buffers[0] = []
             else:
-                seq = self._pop_sequence_for_level(i, z_input)  # (B, T, d)
+                seq = self._pop_sequence_for_level(i, z_input)
 
             pred_from_above: Optional[torch.Tensor] = None
             if i + 1 < len(self._level_states):
@@ -120,25 +119,20 @@ class MultiRateRunner:
                 if above_state.last_z is not None:
                     above_level = self.model.levels[i + 1]
                     with torch.no_grad():
-                        pfa = above_level.predict_downward(
-                            above_state.last_z
-                        )  # (B, d_below)
+                        pfa = above_level.predict_downward(above_state.last_z)
                     T = seq.shape[1]
-                    pred_from_above = pfa.unsqueeze(1).expand(-1, T, -1)  # (B, T, d)
+                    pred_from_above = pfa.unsqueeze(1).expand(-1, T, -1)
 
             h_in = state.hidden.detach()
 
             if seq.shape[1] == 1:
                 pfa = pred_from_above[:, 0] if pred_from_above is not None else None
-                z_t, z_hat_t, _, h_new, eps_t = level.step(
-                    seq[:, 0], h_in, pfa
-                )
+                z_t, _, h_new, eps_t = level.step(seq[:, 0], h_in, pfa)
                 z_seq = z_t.unsqueeze(1)
-                z_hat_next_seq = z_hat_t.unsqueeze(1)
                 epsilon = eps_t.unsqueeze(1)
                 sigreg_loss = level.sigreg.compute_loss_online()
             else:
-                z_seq, z_hat_next_seq, _, h_new, epsilon, sigreg_loss = level.forward(
+                z_seq, _, h_new, epsilon, sigreg_loss = level.forward(
                     seq, h_in, pred_from_above
                 )
 
@@ -148,12 +142,8 @@ class MultiRateRunner:
             loss = surprise_i + sigreg_loss
 
             if i == self.model.control_level_idx and prev_action is not None:
-                z_ctrl = z_seq[:, -1]  # (B, d_repr)
-                z_hat_ctrl = z_hat_next_seq[:, -1]  # (B, d_repr)
-                ctrl_in = torch.cat(
-                    [z_ctrl.unsqueeze(1), z_hat_ctrl.unsqueeze(1)], dim=-1
-                )  # (B, 1, 2*d_repr)
-                action_pred_ctrl = self.model.control_head(ctrl_in)[:, -1]
+                z_ctrl = z_seq[:, -1].unsqueeze(1)
+                action_pred_ctrl = self.model.control_head(z_ctrl)[:, -1]
                 ctrl_loss = F.mse_loss(action_pred_ctrl, prev_action)
                 loss = loss + self._ctrl_weight * ctrl_loss
 
@@ -165,13 +155,12 @@ class MultiRateRunner:
             state.update(
                 hidden=h_new.detach(),
                 z=z_seq[:, -1].detach(),
-                z_hat_next=z_hat_next_seq[:, -1].detach(),
                 pred_error=epsilon.detach(),
                 tick=current_tick,
                 sim_time=sim_time,
             )
 
-            z_input = z_seq.detach()  # (B, T, d_repr_i)
+            z_input = z_seq.detach()
 
         if surprise_terms:
             total_surprise = torch.stack(surprise_terms).sum()
@@ -179,12 +168,8 @@ class MultiRateRunner:
         ctrl_idx = self.model.control_level_idx
         ctrl_state = self._level_states[ctrl_idx]
 
-        z_ctrl = ctrl_state.last_z.unsqueeze(1)  # (B, 1, d_repr)
-        z_hat_ctrl = ctrl_state.last_z_hat_next.unsqueeze(1)  # (B, 1, d_repr)
-
-        action = self.model.control_head(torch.cat([z_ctrl, z_hat_ctrl], dim=-1))[
-            :, -1
-        ]  # (B, action_dim)
+        z_ctrl = ctrl_state.last_z.unsqueeze(1)
+        action = self.model.control_head(z_ctrl)[:, -1]
 
         if diagnostics is not None and diagnostics.cfg.enabled:
             diagnostics.record_tick(
@@ -254,7 +239,7 @@ class MultiRateRunner:
                     device=self.device,
                 )
             )
-        return torch.cat(parts, dim=-1)  # (B, d_input)
+        return torch.cat(parts, dim=-1)
 
     def _pop_sequence_for_level(
         self, level_idx: int, fallback_z: torch.Tensor
@@ -262,9 +247,9 @@ class MultiRateRunner:
         buf = self._accum_buffers[level_idx]
 
         if self.cfg.accumulate_for_upper and buf:
-            seq = torch.stack(buf, dim=1)  # (B, T, d)
+            seq = torch.stack(buf, dim=1)
             self._accum_buffers[level_idx] = []
             return seq
 
         self._accum_buffers[level_idx] = []
-        return fallback_z  # already (B, T, d)
+        return fallback_z

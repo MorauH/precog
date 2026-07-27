@@ -42,7 +42,7 @@ class DiagnosticsConfig:
     stats_interval: int = 10  # compute expensive stats every N ticks
     compute_grad_norms: bool = True
     compute_param_norms: bool = True
-    compute_ema_alignment: bool = True
+    compute_sigreg: bool = True
     log_to_csv: bool = False
     csv_path: str = "diagnostics.csv"
 
@@ -55,7 +55,7 @@ class DiagnosticsConfig:
 @dataclass
 class _LevelAccumulator:
     updates: int = 0  # ticks this level updated in window
-    expensive_samples: int = 0  # ticks with grad/param/ema data
+    expensive_samples: int = 0  # ticks with grad/param/sigreg data
     surprise_sum: float = 0.0
     surprise_min: float = float("inf")
     surprise_max: float = float("-inf")
@@ -69,7 +69,10 @@ class _LevelAccumulator:
     grad_norm_sum: float = 0.0
     grad_norm_max: float = -1.0
     param_norm_sum: float = 0.0
-    ema_align_sum: float = 0.0
+    sigreg_avg_std_sum: float = 0.0
+    sigreg_min_std_last: float = 0.0
+    sigreg_off_rms_sum: float = 0.0
+    sigreg_dim_below_sum: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +123,10 @@ class DiagnosticsCollector:
                     "alpha",
                     "grad_norm",
                     "param_norm",
-                    "ema_align",
+                    "sigreg_avg_std",
+                    "sigreg_min_std",
+                    "sigreg_off_rms",
+                    "sigreg_dim_below",
                     "proc_time",
                 ],
             )
@@ -200,19 +206,19 @@ class DiagnosticsCollector:
                     acc.grad_norm_sum += g_norm
                     acc.grad_norm_max = max(acc.grad_norm_max, g_norm)
 
-                    if hasattr(self.model, "control_head"):
-                        g_ctrl = _total_grad_norm(self.model.control_head)
-                        if i == self.model.control_level_idx:
-                            acc.grad_norm_sum += g_ctrl
-
                 if self.cfg.compute_param_norms:
                     acc.param_norm_sum += _total_param_norm(level)
 
-                if self.cfg.compute_ema_alignment:
-                    acc.ema_align_sum += _param_divergence(level.ssm, level.ssm_target)
+                if self.cfg.compute_sigreg and hasattr(level, "sigreg"):
+                    metrics = level.sigreg.covariance_metrics()
+                    acc.sigreg_avg_std_sum += metrics["sigreg_avg_std"]
+                    acc.sigreg_min_std_last = metrics["sigreg_min_std"]
+                    acc.sigreg_off_rms_sum += metrics["sigreg_off_rms"]
+                    acc.sigreg_dim_below_sum += metrics["sigreg_dim_below_thresh"]
 
             # -- CSV ---------------------------------------------------------
             if self._csv_writer is not None:
+                sigreg_avg_std = acc.sigreg_avg_std_sum / max(acc.expensive_samples, 1)
                 self._csv_writer.writerow(
                     {
                         "elapsed": round(time.monotonic() - self._window_start_wall, 4),
@@ -231,9 +237,14 @@ class DiagnosticsCollector:
                         "param_norm": round(
                             acc.param_norm_sum / max(acc.expensive_samples, 1), 4
                         ),
-                        "ema_align": round(acc.ema_align_sum / acc.updates, 4)
-                        if acc.updates > 0
-                        else 0.0,
+                        "sigreg_avg_std": round(sigreg_avg_std, 4),
+                        "sigreg_min_std": round(acc.sigreg_min_std_last, 4),
+                        "sigreg_off_rms": round(
+                            acc.sigreg_off_rms_sum / max(acc.expensive_samples, 1), 4
+                        ),
+                        "sigreg_dim_below": round(
+                            acc.sigreg_dim_below_sum / max(acc.expensive_samples, 1), 4
+                        ),
                         "proc_time": round(process_time, 6)
                         if process_time is not None
                         else 0.0,
@@ -294,7 +305,10 @@ class DiagnosticsCollector:
             acc.grad_norm_sum = 0.0
             acc.grad_norm_max = -1.0
             acc.param_norm_sum = 0.0
-            acc.ema_align_sum = 0.0
+            acc.sigreg_avg_std_sum = 0.0
+            acc.sigreg_min_std_last = 0.0
+            acc.sigreg_off_rms_sum = 0.0
+            acc.sigreg_dim_below_sum = 0.0
 
     def _build_report_lines(self) -> List[str]:
         elapsed = time.monotonic() - self._window_start_wall
@@ -334,8 +348,6 @@ class DiagnosticsCollector:
             if acc.updates == 0:
                 continue
             n = acc.updates
-            s_min = acc.surprise_min
-            s_max = acc.surprise_max
             surprise = f"{acc.surprise_sum / n:.4f}"
             z_norm = f"{acc.z_norm_sum / n:.2f}"
             z_std = f"{acc.z_std_sum / n:.3f}"
@@ -379,15 +391,23 @@ class DiagnosticsCollector:
                 for w in warnings:
                     lines.append(f"         ⚠  {w}")
 
-        if self.cfg.compute_ema_alignment:
+        if self.cfg.compute_sigreg:
             lines.append("")
-            lines.append(f"  {'level':<7s} {'EMA align':>10s}")
-            lines.append("  " + "-" * 20)
+            lines.append(
+                f"  {'level':<7s} {'SIGReg avgσ':>10s} {'minσ':>10s} {'off-rms':>10s} {'dim<thr%':>8s}"
+            )
+            lines.append("  " + "-" * 42)
             for i, acc in enumerate(self._levels):
                 if acc.updates == 0:
                     continue
-                align = acc.ema_align_sum / max(acc.expensive_samples, 1)
-                lines.append(f"  L{i:<6d} {align:>10.4f}")
+                m = max(acc.expensive_samples, 1)
+                avg_std = acc.sigreg_avg_std_sum / m
+                min_std = acc.sigreg_min_std_last
+                off_rms = acc.sigreg_off_rms_sum / m
+                dim_below = acc.sigreg_dim_below_sum / m * 100
+                lines.append(
+                    f"  L{i:<6d} {avg_std:>10.4f} {min_std:>10.4f} {off_rms:>10.4f} {dim_below:>7.1f}%"
+                )
 
         lines.append("")
         return lines
@@ -411,15 +431,3 @@ def _total_param_norm(module: torch.nn.Module) -> float:
     for p in module.parameters():
         total += float(p.data.norm().item() ** 2)
     return total**0.5
-
-
-def _param_divergence(
-    ssm_online: torch.nn.Module,
-    ssm_target: torch.nn.Module,
-) -> float:
-    """L2 distance between online and target SSM parameter vectors."""
-    with torch.no_grad():
-        total = 0.0
-        for po, pt in zip(ssm_online.parameters(), ssm_target.parameters()):
-            total += (po - pt).pow(2).sum().item()
-        return total**0.5

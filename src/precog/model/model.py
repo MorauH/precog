@@ -72,7 +72,6 @@ class HierarchicalPCWorldModel(nn.Module):
         obs_dict: Dict[str, torch.Tensor],
         prev_action: Optional[torch.Tensor] = None,
         hidden_states: Optional[List[torch.Tensor]] = None,
-        hidden_states_target: Optional[List[torch.Tensor]] = None,
         return_all: bool = False,
     ):
         batch = next(iter(obs_dict.values())).shape[0]
@@ -81,11 +80,6 @@ class HierarchicalPCWorldModel(nn.Module):
         if hidden_states is None:
             hidden_states = [
                 level.init_hidden(batch, device=obs_device) for level in self.levels
-            ]
-        if hidden_states_target is None:
-            hidden_states_target = [
-                level.init_hidden_target(batch, device=obs_device)
-                for level in self.levels
             ]
 
         parts = [obs_dict[key] for key in self.config.observation_keys]
@@ -115,20 +109,20 @@ class HierarchicalPCWorldModel(nn.Module):
         pred_below_list: List[torch.Tensor] = []
         prediction_errors: List[torch.Tensor] = []
         h_new_list: List[torch.Tensor] = []
-        h_target_new_list: List[torch.Tensor] = []
+        sigreg_losses: List[torch.Tensor] = []
 
         curr = z_level
         for i, level in enumerate(self.levels):
             z_below_inputs.append(curr)
-            z_seq, _, z_hat_next_seq, pred_below_seq, h_new, h_target_new, epsilon = (
-                level.forward(curr, hidden_states[i], hidden_states_target[i], None)
+            z_seq, z_hat_next_seq, pred_below_seq, h_new, epsilon, sigreg_loss = (
+                level.forward(curr, hidden_states[i], None)
             )
             h_new_list.append(h_new)
-            h_target_new_list.append(h_target_new)
             z_levels_raw.append(z_seq)
             z_hat_next_list.append(z_hat_next_seq)
             pred_below_list.append(pred_below_seq)
             prediction_errors.append(epsilon)
+            sigreg_losses.append(sigreg_loss)
             curr = z_seq
 
         # ---------------------------------------------------------------- #
@@ -162,7 +156,7 @@ class HierarchicalPCWorldModel(nn.Module):
             "prediction_errors": prediction_errors,
             "total_surprise": sum(e.pow(2).mean() for e in prediction_errors),
             "hidden_states": h_new_list,
-            "hidden_states_target": h_target_new_list,
+            "sigreg_losses": sigreg_losses,
         }
 
     # ------------------------------------------------------------------ #
@@ -193,14 +187,6 @@ class HierarchicalPCWorldModel(nn.Module):
                     pass
 
     # ------------------------------------------------------------------ #
-    # EMA update
-    # ------------------------------------------------------------------ #
-
-    def update_ema(self, tau: float = 0.997):
-        for level in self.levels:
-            level.update_target_ema(tau)
-
-    # ------------------------------------------------------------------ #
     # Multi-rate runner factory
     # ------------------------------------------------------------------ #
 
@@ -212,7 +198,6 @@ class HierarchicalPCWorldModel(nn.Module):
         device: str = "cpu",
         accumulate_for_upper: bool = True,
         online_learning: bool = True,
-        grad_accumulation_steps: int = 1,
     ) -> MultiRateRunner:
         if len(level_frequencies) != len(self.levels):
             raise ValueError(
@@ -226,7 +211,6 @@ class HierarchicalPCWorldModel(nn.Module):
             device=device,
             accumulate_for_upper=accumulate_for_upper,
             online_learning=online_learning,
-            grad_accumulation_steps=grad_accumulation_steps,
             imitation_loss_weight=self.config.imitation_loss_weight,
         )
         return MultiRateRunner(self, cfg)

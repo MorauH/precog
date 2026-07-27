@@ -64,16 +64,29 @@ The PC learning signal has two parts:
 In the online setting, the magnitude of ε_below at runtime is used as an
 uncertainty signal: high error → unfamiliar situation → increase learning
 rate, reduce trust in control output.
+
+──────────────────────────────────────────────
+JEPA + SIGReg
+──────────────────────────────────────────────
+
+This level uses SIGReg (Sigma Regularization) instead of a separate EMA
+target network. SIGReg prevents representational collapse by regularizing
+the covariance matrix of the online representations.
+
+For JEPA, the prediction target is simply the online encoder's output from
+the next timestep, detached:  z[t+1].detach().
+
+  jepa_loss_t = MSE(ẑ_{t+1},  z_{t+1}.detach())
 """
 
 from typing import Optional, Tuple
-import copy
 
 import torch
 import torch.nn as nn
 
 from .config import PCLevelConfig
 from .fnn import FNN
+from .sigreg import SIGReg
 from .ssm import SelectiveSSM
 
 
@@ -112,10 +125,14 @@ class PCLevel(nn.Module):
             config=config.ssm,
         )
 
-        # Target SSM - updated by EMA only
-        self.ssm_target = copy.deepcopy(self.ssm)
-        for p in self.ssm_target.parameters():
-            p.requires_grad_(False)
+        # ------------------------------------------------------------------
+        # SIGReg — prevents representational collapse (replaces EMA target)
+        # ------------------------------------------------------------------
+        self.sigreg = SIGReg(
+            d_repr=config.d_representation,
+            online_tau=config.sigreg_tau,
+            var_threshold=config.sigreg_var_threshold,
+        )
 
         # ------------------------------------------------------------------
         # 2. PREDICT DOWNWARD — top-down generative prediction
@@ -170,23 +187,6 @@ class PCLevel(nn.Module):
     def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Zero-initialised SSM hidden state. (batch, d_state)"""
         return self.ssm.init_hidden(batch_size, device)
-
-    def init_hidden_target(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """Zero-initialised target SSM hidden state. (batch, d_state)"""
-        return self.ssm_target.init_hidden(batch_size, device)
-
-    # -----------------------------------------------------------------------
-    # Target update
-    # -----------------------------------------------------------------------
-
-    @torch.no_grad()
-    def update_target_ema(self, tau: float = 0.997) -> None:
-        """Call after every optimizer step."""
-        torch._foreach_lerp_(
-            list(self.ssm_target.parameters()),
-            list(self.ssm.parameters()),
-            weight=1.0 - tau,
-        )
 
     # -----------------------------------------------------------------------
     # Top-down correction (refinement pass, no SSM re-run)
@@ -256,77 +256,52 @@ class PCLevel(nn.Module):
     def step(
         self,
         z_below: torch.Tensor,  # (batch, d_below)
-        h: torch.Tensor,  # (batch, d_state) - online
-        h_target: torch.Tensor,  # (batch, d_state) - target
+        h: torch.Tensor,  # (batch, d_state)
         pred_from_above: Optional[torch.Tensor],  # (batch, d_repr) | None
     ) -> Tuple[
-        torch.Tensor,  # z_t          online representation  (batch, d_repr)
-        torch.Tensor,  # z_t_target   target representation  (batch, d_repr)
-        torch.Tensor,  # z_hat_next   forward prediction     (batch, d_repr)
-        torch.Tensor,  # pred_below   downward prediction    (batch, d_below)
-        torch.Tensor,  # h_new        updated hidden state   (batch, d_state)
-        torch.Tensor,  # h_target_new updated hidden state   (batch, d_state)
-        torch.Tensor,  # epsilon_below prediction error      (batch, d_below)
+        torch.Tensor,  # z_t          representation           (batch, d_repr)
+        torch.Tensor,  # z_hat_next   forward prediction       (batch, d_repr)
+        torch.Tensor,  # pred_below   downward prediction      (batch, d_below)
+        torch.Tensor,  # h_new        updated hidden state     (batch, d_state)
+        torch.Tensor,  # epsilon_below prediction error        (batch, d_below)
     ]:
         """
-        Process a single timestep — used during online inference and
-        step-by-step continuous learning on the car.
+        Process a single timestep — used during online inference.
 
-        JEPA integration
-        ────────────────
-        The step now runs two SSM paths in parallel:
+        SIGReg integration
+        ─────────────────
+        The step runs a single SSM path. SIGReg replaces the EMA target
+        network by maintaining an online covariance estimate that prevents
+        representational collapse.  The estimate is updated here; the loss
+        is computed periodically by the runner.
 
-          Online path  (self.ssm)        — receives gradients, drives learning.
-          Target path  (self.ssm_target) — no gradients, EMA-updated only.
+        predict_forward reads from z_t and produces ẑ_{t+1}.
+        For JEPA the training loop pairs:
 
-        predict_forward reads from z_t (online) and produces ẑ_{t+1}.
-        The JEPA loss is computed *outside* this function by the training loop:
+            jepa_loss_t = MSE(ẑ_{t+1},  z_{t+1}.detach())
 
-            jepa_loss_t = MSE(ẑ_{t+1},  z_target_{t+1}.detach())
-                                ↑ from this step    ↑ from next step's z_t_target
-
-        Gradients flow:  jepa_loss → predict_forward → online SSM
-        No gradients to: target SSM (detach enforced by requires_grad=False + no_grad)
-
-        PC integration
-        ──────────────
-        predict_downward and error propagation are unchanged. They operate on
-        z_t (online) so they remain part of the gradient graph as before.
-        The PC loss and JEPA loss are separate terms summed in the training loop.
+        No separate target network is needed — SIGReg keeps z_t healthy.
 
         Args:
             z_below:         Representation from the level below at time t.
-            h:               Online SSM hidden state from t-1.
-            h_target:        Target SSM hidden state from t-1.
+            h:               SSM hidden state from t-1.
             pred_from_above: Top-down prediction of this level from level above.
                              None if this is the top level.
 
         Returns:
-            z_t:           Online representation (used for PC + control).
-            z_t_target:    Target representation (used as JEPA target at t+1).
-            z_hat_next:    One-step-ahead prediction (JEPA source at t, loss at t+1).
+            z_t:           Representation (used for PC + control).
+            z_hat_next:    One-step-ahead prediction.
             pred_below:    Top-down prediction of what z_below should be.
-            h_new:         Updated online hidden state.
-            h_target_new:  Updated target hidden state.
+            h_new:         Updated hidden state.
             epsilon_below: PC prediction error for the level below.
                            Magnitude is the runtime uncertainty signal.
         """
-        # ── (a) Online path — gradient-enabled ────────────────────────────
         z_raw, h_new = self.ssm.step(z_below, h)  # (batch, d_repr)
 
-        # ── (b) Target path — params have requires_grad=False ──────────────
-        #    z_t_target is the JEPA prediction target for the *previous*
-        #    timestep's z_hat_next. The training loop pairs them as:
-        #        loss += MSE(z_hat_next[t-1], z_t_target[t].detach())
-        z_t_target, h_target_new = self.ssm_target.step(
-            z_below, h_target
-        )  # (batch, d_repr)
+        # ── SIGReg — update online covariance estimate (detached) ─────────
+        self.sigreg.update_online(z_raw.detach().squeeze(0))
 
-        # ── (c) Top-down PC error correction — online path only ───────────
-        #    ε_above = z_raw - pred_from_above  (surprise at this level)
-        #    z_t = z_raw + α · correction(ε_above)
-        #    The target path is not modulated: it must remain a clean,
-        #    stable encoding of the input for use as a JEPA target.
+        # ── Top-down PC error correction ──────────────────────────────────
         if pred_from_above is not None and self.error_correction is not None:
             epsilon_above = z_raw - pred_from_above  # (batch, d_repr)
             correction = self.error_correction(epsilon_above)  # (batch, d_repr)
@@ -334,27 +309,20 @@ class PCLevel(nn.Module):
         else:
             z_t = z_raw
 
-        # ── (d) Predict downward — PC generative path ─────────────────────
+        # ── Predict downward — PC generative path ─────────────────────────
         pred_below = self.predict_downward(z_t)  # (batch, d_below)
 
-        # ── (e) Predict forward — JEPA anticipatory path ──────────────────
-        #    Gradients flow through predict_forward and back into the online
-        #    SSM. z_t_target (next step) is the target — detached in the
-        #    training loop, not here, so we can accumulate it freely.
+        # ── Predict forward — JEPA anticipatory path ──────────────────────
         z_hat_next = self.predict_forward(z_t)  # (batch, d_repr)
 
-        # ── (f) PC prediction error for the level below ───────────────────
-        #    z_below is detached so gradients flow through pred_below only,
-        #    preserving the PC local learning rule.
+        # ── PC prediction error for the level below ───────────────────────
         epsilon_below = z_below.detach() - pred_below  # (batch, d_below)
 
         return (
             z_t,
-            z_t_target,
             z_hat_next,
             pred_below,
             h_new,
-            h_target_new,
             epsilon_below,
         )
 
@@ -362,45 +330,33 @@ class PCLevel(nn.Module):
         self,
         z_below_seq: torch.Tensor,  # (batch, seq, d_below)
         h0: Optional[torch.Tensor] = None,  # (batch, d_state)
-        h0_target: Optional[torch.Tensor] = None,  # (batch, d_state)
         pred_from_above_seq: Optional[torch.Tensor] = None,  # (batch, seq, d_repr)
     ) -> Tuple[
         torch.Tensor,  # z_seq             (batch, seq, d_repr)
-        torch.Tensor,  # z_target_seq      (batch, seq, d_repr)
         torch.Tensor,  # z_hat_next_seq    (batch, seq, d_repr)
         torch.Tensor,  # pred_below_seq    (batch, seq, d_below)
         torch.Tensor,  # h_final           (batch, d_state)
-        torch.Tensor,  # h_target_final    (batch, d_state)
         torch.Tensor,  # epsilon_below_seq (batch, seq, d_below)
+        torch.Tensor,  # sigreg_loss       scalar
     ]:
         """
-        Process a full sequence — used during offline pre-training on logs.
+        Process a full sequence — used for upper levels that accumulate
+        slower-rate inputs or for batch processing.
 
         Iterates step() across time, accumulating all outputs.
 
-        JEPA loss is computed by the training loop after this call:
+        SIGReg loss is computed from the sequence batch and returned for
+        addition to the training loss.
 
-            # Align: prediction at t should match target at t+1
-            jepa_loss = MSE(
-                z_hat_next_seq[:, :-1],       # predictions  t=0..T-2
-                z_target_seq [:, 1: ].detach() # targets      t=1..T-1
-            )
-
-        h_final and h_target_final can warm-start the next segment,
-        preserving continuity across log file boundaries or lap transitions.
+        h_final can warm-start the next segment, preserving continuity
+        across log file boundaries or lap transitions.
         """
         batch_size, seq_len, _ = z_below_seq.shape
         device = z_below_seq.device
 
         h = h0 if h0 is not None else self.init_hidden(batch_size, device)
-        h_target = (
-            h0_target
-            if h0_target is not None
-            else self.init_hidden_target(batch_size, device)
-        )
 
-        z_list, z_target_list, z_hat_next_list, pred_below_list, eps_list = (
-            [],
+        z_list, z_hat_next_list, pred_below_list, eps_list = (
             [],
             [],
             [],
@@ -410,24 +366,24 @@ class PCLevel(nn.Module):
         for t in range(seq_len):
             pfa = pred_from_above_seq[:, t] if pred_from_above_seq is not None else None
 
-            z_t, z_t_target, z_hat_next, pred_below, h, h_target, eps = self.step(
-                z_below_seq[:, t], h, h_target, pfa
+            z_t, z_hat_next, pred_below, h, eps = self.step(
+                z_below_seq[:, t], h, pfa
             )
 
             z_list.append(z_t)
-            z_target_list.append(z_t_target)
             z_hat_next_list.append(z_hat_next)
             pred_below_list.append(pred_below)
             eps_list.append(eps)
 
+        z_seq = torch.stack(z_list, dim=1)
+
         return (
-            torch.stack(z_list, dim=1),
-            torch.stack(z_target_list, dim=1),
+            z_seq,
             torch.stack(z_hat_next_list, dim=1),
             torch.stack(pred_below_list, dim=1),
             h,
-            h_target,
             torch.stack(eps_list, dim=1),
+            self.sigreg.batch_loss(z_seq),
         )
 
     # -----------------------------------------------------------------------

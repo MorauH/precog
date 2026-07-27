@@ -171,7 +171,6 @@ def example_training(model: HierarchicalPCWorldModel, dataloader, optimizer):
 
     model.train()
     hidden = None
-    hidden_target = None
 
     for batch in dataloader:
         obs_dict = batch["obs"]  # (B, T, d_sensor)
@@ -181,23 +180,21 @@ def example_training(model: HierarchicalPCWorldModel, dataloader, optimizer):
             obs_dict,
             prev_action=batch.get("prev_action"),
             hidden_states=hidden,
-            hidden_states_target=hidden_target,
             return_all=True,
         )
 
         # Chain hidden states across chunks (TBPTT)
         hidden = [h.detach() for h in out["hidden_states"]]
-        hidden_target = [h.detach() for h in out["hidden_states_target"]]
 
         # Losses
         action_loss = torch.nn.functional.mse_loss(out["action_pred"], actions_gt)
         surprise_loss = out["total_surprise"]
-        loss = action_loss + 0.01 * surprise_loss
+        sigreg_loss = sum(out["sigreg_losses"])
+        loss = action_loss + 0.01 * surprise_loss + 0.01 * sigreg_loss
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        model.update_ema(tau=0.997)
 
 
 # -----------------------------------------------------------------------

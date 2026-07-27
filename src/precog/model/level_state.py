@@ -30,8 +30,6 @@ class LevelState:
         Which level this belongs to (0 = lowest / fastest).
     hidden:
         SSM hidden state, shape (B, d_state).
-    hidden_target:
-        EMA target network hidden state, shape (B, d_state).
     last_z:
         Most-recently-produced representation, shape (B, d_repr).
         Held constant between updates (zero-order hold).
@@ -47,9 +45,8 @@ class LevelState:
     """
     level_idx: int
 
-    # Hidden states
+    # Hidden state
     hidden: torch.Tensor                      # (B, d_state)
-    hidden_target: torch.Tensor               # (B, d_state)
 
     # Cached outputs (zero-order hold between updates)
     last_z: Optional[torch.Tensor] = None          # (B, d_repr)
@@ -67,7 +64,6 @@ class LevelState:
     def update(
         self,
         hidden: torch.Tensor,
-        hidden_target: torch.Tensor,
         z: torch.Tensor,
         z_hat_next: torch.Tensor,
         pred_error: torch.Tensor,
@@ -76,7 +72,6 @@ class LevelState:
     ):
         """Atomically update all fields after a forward pass."""
         self.hidden = hidden
-        self.hidden_target = hidden_target
         self.last_z = z
         self.last_z_hat_next = z_hat_next
         self.last_pred_error = pred_error
@@ -86,7 +81,6 @@ class LevelState:
     def detach_(self):
         """Detach all tensors in-place (call between episodes or gradient steps)."""
         self.hidden = self.hidden.detach()
-        self.hidden_target = self.hidden_target.detach()
         if self.last_z is not None:
             self.last_z = self.last_z.detach()
         if self.last_z_hat_next is not None:
@@ -106,7 +100,6 @@ class LevelState:
         return cls(
             level_idx=level_idx,
             hidden=torch.zeros(batch_size, d_state, device=device, dtype=dtype),
-            hidden_target=torch.zeros(batch_size, d_state, device=device, dtype=dtype),
             last_z=torch.zeros(batch_size, d_repr, device=device, dtype=dtype),
             last_z_hat_next=torch.zeros(batch_size, d_repr, device=device, dtype=dtype),
         )

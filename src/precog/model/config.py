@@ -17,6 +17,8 @@ class PCLevelConfig:
     ssm: SSMConfig
     prediction_head_hidden: List[int] = field(default_factory=lambda: [64])
     forward_head_hidden: List[int] = field(default_factory=lambda: [64])
+    sigreg_tau: float = 0.999
+    sigreg_var_threshold: float = 0.1
 
 
 @dataclass

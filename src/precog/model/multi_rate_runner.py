@@ -24,9 +24,7 @@ class RunnerConfig:
     accumulate_for_upper: bool = True
     online_learning: bool = True
     learning_rate: float = 1e-3
-    ema_tau: float = 0.997
     imitation_loss_weight: float = 1.0
-    grad_accumulation_steps: int = 1  # optimizer step every N ticks
 
 
 @dataclass
@@ -58,11 +56,8 @@ class MultiRateRunner:
 
         self._optimizers: List[torch.optim.Optimizer] = []
         self._lr = runner_cfg.learning_rate
-        self._ema_tau = runner_cfg.ema_tau
         self._online_learning = runner_cfg.online_learning
         self._ctrl_weight = runner_cfg.imitation_loss_weight
-        self._grad_accum_steps = max(1, runner_cfg.grad_accumulation_steps)
-        self._opt_step_counters = [0] * len(runner_cfg.level_frequencies)
 
         ctrl_idx = self.model.control_level_idx
         for i, level in enumerate(self.model.levels):
@@ -132,27 +127,25 @@ class MultiRateRunner:
                     pred_from_above = pfa.unsqueeze(1).expand(-1, T, -1)  # (B, T, d)
 
             h_in = state.hidden.detach()
-            h_target_in = state.hidden_target.detach()
 
-            # Use step() for single-timestep inputs to avoid forward() overhead
             if seq.shape[1] == 1:
                 pfa = pred_from_above[:, 0] if pred_from_above is not None else None
-                z_t, z_target_t, z_hat_t, _, h_new, h_target_new, eps_t = level.step(
-                    seq[:, 0], h_in, h_target_in, pfa
+                z_t, z_hat_t, _, h_new, eps_t = level.step(
+                    seq[:, 0], h_in, pfa
                 )
                 z_seq = z_t.unsqueeze(1)
-                z_target_seq = z_target_t.unsqueeze(1)
                 z_hat_next_seq = z_hat_t.unsqueeze(1)
                 epsilon = eps_t.unsqueeze(1)
+                sigreg_loss = level.sigreg.compute_loss_online()
             else:
-                z_seq, z_target_seq, z_hat_next_seq, _, h_new, h_target_new, epsilon = (
-                    level.forward(seq, h_in, h_target_in, pred_from_above)
+                z_seq, z_hat_next_seq, _, h_new, epsilon, sigreg_loss = level.forward(
+                    seq, h_in, pred_from_above
                 )
 
             surprise_i = epsilon.pow(2).mean()
             surprise_terms.append(surprise_i.detach())
 
-            loss = surprise_i
+            loss = surprise_i + sigreg_loss
 
             if i == self.model.control_level_idx and prev_action is not None:
                 z_ctrl = z_seq[:, -1]  # (B, d_repr)
@@ -165,19 +158,12 @@ class MultiRateRunner:
                 loss = loss + self._ctrl_weight * ctrl_loss
 
             if self._online_learning and self._lr > 0:
-                (loss / self._grad_accum_steps).backward()
-                self._opt_step_counters[i] += 1
-
-                if self._opt_step_counters[i] >= self._grad_accum_steps:
-                    self._optimizers[i].step()
-                    self._optimizers[i].zero_grad()
-                    if hasattr(level, "update_target_ema"):
-                        level.update_target_ema(self._ema_tau)
-                    self._opt_step_counters[i] = 0
+                loss.backward()
+                self._optimizers[i].step()
+                self._optimizers[i].zero_grad()
 
             state.update(
                 hidden=h_new.detach(),
-                hidden_target=h_target_new.detach(),
                 z=z_seq[:, -1].detach(),
                 z_hat_next=z_hat_next_seq[:, -1].detach(),
                 pred_error=epsilon.detach(),

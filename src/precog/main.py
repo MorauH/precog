@@ -134,7 +134,7 @@ def main():
         report_interval_seconds=2.0,
         compute_grad_norms=True,
         compute_param_norms=True,
-        compute_ema_alignment=True,
+        compute_sigreg=True,
     )
     diagnostics = DiagnosticsCollector(model, diag_cfg)
 
@@ -144,7 +144,6 @@ def main():
         batch_size=1,
         device=device,
         online_learning=True,
-        grad_accumulation_steps=3,
     )
 
     dashboard = None

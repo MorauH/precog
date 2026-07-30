@@ -56,6 +56,7 @@ class HierarchicalPCWorldModel(nn.Module):
             input_dim=control_input_dim,
             hidden_dims=ctrl_cfg.hidden_dims,
             output_dim=ctrl_cfg.output_dim,
+            output_scales=ctrl_cfg.output_scales or None,
         )
 
         self.control_level_idx = config.control_level_idx

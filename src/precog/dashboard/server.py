@@ -163,9 +163,7 @@ class DashboardServer:
                 if current_seq > last_sent_seq and current:
                     last_sent_seq = current_seq
                     try:
-                        await ws.send_text(
-                            json.dumps(current, default=_json_fallback)
-                        )
+                        await ws.send_text(json.dumps(current, default=_json_fallback))
                     except Exception:
                         break
         except (WebSocketDisconnect, ConnectionError):
@@ -183,22 +181,10 @@ class DashboardServer:
 
         if "set_blend_steer" in cmd:
             self._controls.set_blend_steer(cmd["set_blend_steer"])
-            with self._data_lock:
-                if self._latest:
-                    self._latest["blend_ratio_steer"] = self._controls.blend_steer_safe
-                self._latest_seq += 1
         if "set_blend_acc" in cmd:
             self._controls.set_blend_acc(cmd["set_blend_acc"])
-            with self._data_lock:
-                if self._latest:
-                    self._latest["blend_ratio_acc"] = self._controls.blend_acc_safe
-                self._latest_seq += 1
         if "set_mode" in cmd:
             self._controls.set_mode(cmd["set_mode"])
-            with self._data_lock:
-                if self._latest:
-                    self._latest["mode"] = self._controls.mode_safe
-                self._latest_seq += 1
 
     # ------------------------------------------------------------------ #
     # Internal

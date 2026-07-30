@@ -162,6 +162,7 @@ btnDrive.addEventListener('click', () => send({ set_mode: 'DRIVE' }));
 let lastBlendSteer = 0;
 let lastBlendAcc = 0;
 function updateModeUI(mode) {
+  const isNewMode = currentMode !== mode;
   currentMode = mode;
   btnImitate.className = mode === 'IMITATE' ? 'active' : '';
   btnDrive.className = mode === 'DRIVE' ? 'active' : '';
@@ -173,7 +174,7 @@ function updateModeUI(mode) {
     [blendSteerSlider, blendAccSlider].forEach(s => s.style.opacity = '0.4');
     blendSteerLabel.textContent = '0% (auto only)';
     blendAccLabel.textContent = '0% (auto only)';
-  } else {
+  } else if (isNewMode) {
     blendSteerSlider.value = Math.round(lastBlendSteer * 100);
     blendAccSlider.value = Math.round(lastBlendAcc * 100);
     [blendSteerSlider, blendAccSlider].forEach(s => s.style.opacity = '');
@@ -243,11 +244,11 @@ function updateUI(d) {
     document.getElementById('ss_stale').textContent = (staleVal && staleVal.length) ? staleVal.join(', ') : 'none';
   }
 
-  if (d.action !== undefined || d.prev_action !== undefined) {
+  if (d.action !== undefined && d.expert_action !== undefined) {
     const [ms, ma] = vals(d.action);
-    const [ps, pa] = vals(d.prev_action);
-    pushData(chartSteer, steerData, ms, ps);
-    pushData(chartAcc, accData, ma, pa);
+    const [es, ea] = vals(d.expert_action);
+    pushData(chartSteer, steerData, ms, es);
+    pushData(chartAcc, accData, ma, ea);
   }
 
   if (d.surprise !== undefined) {

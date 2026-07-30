@@ -70,7 +70,7 @@ class SIGReg(nn.Module):
         not yet meaningful (e.g. all-zeros).
         """
         cov = self._outer - torch.outer(self._mean, self._mean)
-        var = cov.diag()
+        var = cov.diag().clamp(min=0.0)
         var_loss = F.relu(self.var_threshold - var.sqrt()).mean()
 
         D = self.d_repr
@@ -99,14 +99,14 @@ class SIGReg(nn.Module):
         Returns:
             Scalar loss tensor (0 if N < 2).
         """
-        z = z_seq.reshape(-1, z_seq.shape[-1])   # (N, D)  ,  N = B * T
+        z = z_seq.reshape(-1, z_seq.shape[-1])  # (N, D)  ,  N = B * T
         N, D = z.shape
         if N < 2:
             return torch.tensor(0.0, device=z.device)
 
         z_centered = z - z.mean(dim=0, keepdim=True)
         cov = z_centered.T @ z_centered / (N - 1 + 1e-8)
-        var = cov.diag()
+        var = cov.diag().clamp(min=0.0)
         var_loss = F.relu(var_threshold - var.sqrt()).mean()
 
         idx = torch.arange(D, device=z.device)

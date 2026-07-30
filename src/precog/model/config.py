@@ -30,6 +30,7 @@ class PCLevelConfig:
 class ControlHeadConfig:
     hidden_dims: List[int] = field(default_factory=lambda: [64, 32])
     output_dim: int = 1
+    output_scales: List[float] = field(default_factory=list)
 
 
 @dataclass
@@ -120,6 +121,8 @@ DEFAULT_CONFIG = ModelConfig(
             objective_task_weight=0.1,
         ),
     ],
-    control_head=ControlHeadConfig(hidden_dims=[16, 8], output_dim=2),
-    control_level_idx=1,
+    control_head=ControlHeadConfig(
+        hidden_dims=[16, 8], output_dim=2, output_scales=[0.5, 15.0]
+    ),
+    control_level_idx=0,
 )

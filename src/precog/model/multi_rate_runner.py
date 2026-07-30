@@ -91,6 +91,26 @@ class MultiRateRunner:
         action: Optional[torch.Tensor] = None
 
         z_level0 = self._encode_level0(obs_dict, prev_action)
+        if torch.isnan(z_level0).any():
+            if diagnostics is not None:
+                diagnostics.record_tick(
+                    TickResult(
+                        action=torch.zeros(1, self.model.config.control_dim),
+                        level_states=list(self._level_states),
+                        updated_levels=[],
+                        sim_time=sim_time,
+                        total_surprise=None,
+                    ),
+                    self,
+                    process_time=time.monotonic() - t_start,
+                )
+            return TickResult(
+                action=torch.zeros(self.cfg.batch_size, self.model.config.control_dim),
+                level_states=list(self._level_states),
+                updated_levels=[],
+                sim_time=sim_time,
+                total_surprise=None,
+            )
         z_input = z_level0.unsqueeze(1)
 
         surprise_terms: List[torch.Tensor] = []
@@ -174,9 +194,20 @@ class MultiRateRunner:
                 loss = loss + self._ctrl_weight * ctrl_loss
 
             if self._online_learning and self._lr > 0:
-                loss.backward()
-                self._optimizers[i].step()
-                self._optimizers[i].zero_grad()
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self._optimizers[i].zero_grad()
+                else:
+                    loss.backward()
+                    grad_nan = any(
+                        p.grad is not None and torch.isnan(p.grad).any()
+                        for group in self._optimizers[i].param_groups
+                        for p in group["params"]
+                    )
+                    if grad_nan:
+                        self._optimizers[i].zero_grad()
+                    else:
+                        self._optimizers[i].step()
+                        self._optimizers[i].zero_grad()
 
             state.update(
                 hidden=h_new.detach(),

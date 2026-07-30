@@ -204,8 +204,12 @@ def main():
                     print(f"\n  >>> dashboard: switched to DRIVE mode\n", flush=True)
                     ctrl.set_mode("DRIVE")
 
+            expert_action = _action_from_obs(obs, action_keys, device)
+
             if mode == OperationMode.IMITATE:
-                prev_action = _action_from_obs(obs, action_keys, device)
+                prev_action = expert_action
+            elif prev_action is None and expert_action is not None:
+                prev_action = expert_action
 
             result = runner.tick(obs, prev_action, diagnostics=diagnostics)
 
@@ -225,15 +229,21 @@ def main():
                     if prev_action is not None
                     else [float("nan")] * len(action_keys)
                 )
+                ea = (
+                    expert_action[0].tolist()
+                    if expert_action is not None
+                    else [float("nan")] * len(action_keys)
+                )
                 dashboard.update(
                     {
                         "tick": tick_count,
                         "tick_rate": diagnostics.tick_rate,
                         "mode": mode.name,
-                        "blend_ratio_steer": blend_steer,
-                        "blend_ratio_acc": blend_acc,
+                        "blend_ratio_steer": dashboard.controls.blend_steer_safe,
+                        "blend_ratio_acc": dashboard.controls.blend_acc_safe,
                         "action": ma,
                         "prev_action": pa,
+                        "expert_action": ea,
                         "source_selector": source_selector.snapshot(),
                         "surprise": [
                             (

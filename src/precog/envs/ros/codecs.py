@@ -219,3 +219,20 @@ def _best_path_relative_sampling(snapshot: dict) -> dict:
 
     snapshot[OUT_TOPIC] = sampled.reshape(1, -1)  # [1, 2*S] = [1, 18]
     return snapshot
+
+
+@transform("lateral_deviation")
+def _lateral_deviation(snapshot: dict) -> dict:
+    """Extract lateral path deviation from best_path_relative_sampling.
+
+    The first waypoint (0 m ahead) is where the car sits on the best
+    path.  Its y-coordinate is the lateral offset from path centre.
+    """
+    OUT_TOPIC = "lateral_deviation"
+    path = snapshot.get("best_path_relative_sampling")
+    if path is None:
+        snapshot[OUT_TOPIC] = None
+        return snapshot
+    # shape [1, 18] → slice y of first waypoint (index 1) → [1, 1]
+    snapshot[OUT_TOPIC] = path[:, 1:2]
+    return snapshot

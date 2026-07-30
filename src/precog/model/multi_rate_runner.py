@@ -97,6 +97,7 @@ class MultiRateRunner:
 
         for i, level in enumerate(self.model.levels):
             state = self._level_states[i]
+            lvl_cfg = self.model.config.level_configs[i]
 
             self._accum_buffers[i].append(z_input[:, -1].detach())
 
@@ -125,22 +126,47 @@ class MultiRateRunner:
 
             h_in = state.hidden.detach()
 
+            # ── Task target — build if objective enabled for this level ───
+            task_target = None
+            x_actual = None
+            if lvl_cfg.objective_enabled:
+                b = seq.shape[0]
+                task_target = torch.full(
+                    (b, 1),
+                    lvl_cfg.objective_target_value,
+                    device=self.device,
+                )
+                raw = obs_dict.get(lvl_cfg.objective_observable_key)
+                if raw is not None:
+                    x_actual = raw.reshape(b, -1)[:, :1]
+
+            # ── Forward pass ──────────────────────────────────────────────
             if seq.shape[1] == 1:
                 pfa = pred_from_above[:, 0] if pred_from_above is not None else None
-                z_t, _, h_new, eps_t = level.step(seq[:, 0], h_in, pfa)
+                z_t, _, h_new, eps_t, x_star = level.step(
+                    seq[:, 0], h_in, pfa, task_target
+                )
                 z_seq = z_t.unsqueeze(1)
                 epsilon = eps_t.unsqueeze(1)
                 sigreg_loss = level.sigreg.compute_loss_online()
             else:
-                z_seq, _, h_new, epsilon, sigreg_loss = level.forward(
-                    seq, h_in, pred_from_above
+                z_seq, _, h_new, epsilon, sigreg_loss, x_star_seq = level.forward(
+                    seq, h_in, pred_from_above, task_target
                 )
+                x_star = x_star_seq[:, -1, :] if x_star_seq is not None else None
 
             surprise_i = epsilon.pow(2).mean()
             surprise_terms.append(surprise_i.detach())
 
             loss = surprise_i + sigreg_loss
 
+            # ── Objective losses ─────────────────────────────────────────
+            if x_star is not None and x_actual is not None:
+                loss_ae = F.mse_loss(x_star, x_actual)
+                loss_task = F.mse_loss(x_star, task_target)
+                loss = loss + level.ae_weight * loss_ae + level.task_weight * loss_task
+
+            # ── Imitation loss (control level only) ───────────────────────
             if i == self.model.control_level_idx and prev_action is not None:
                 z_ctrl = z_seq[:, -1].unsqueeze(1)
                 action_pred_ctrl = self.model.control_head(z_ctrl)[:, -1]
@@ -228,7 +254,14 @@ class MultiRateRunner:
         obs_dict: Dict[str, torch.Tensor],
         prev_action: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        parts = [obs_dict[key] for key in self.model.config.observation_keys]
+        shapes = self.model.config.observation_shapes
+        parts = []
+        for key in self.model.config.observation_keys:
+            value = obs_dict.get(key)
+            if value is None:
+                shape = shapes.get(key, (1, 0))
+                value = torch.zeros(self.cfg.batch_size, shape[-1], device=self.device)
+            parts.append(value)
         if prev_action is not None:
             parts.append(prev_action)
         else:

@@ -18,6 +18,12 @@ class PCLevelConfig:
     prediction_head_hidden: List[int] = field(default_factory=lambda: [64])
     sigreg_tau: float = 0.999
     sigreg_var_threshold: float = 0.1
+    objective_enabled: bool = False
+    objective_observable_key: str = ""
+    objective_target_value: float = 0.0
+    objective_ae_weight: float = 1.0
+    objective_task_weight: float = 0.1
+    translator_hidden: List[int] = field(default_factory=lambda: [16])
 
 
 @dataclass
@@ -35,6 +41,7 @@ class ModelConfig:
     control_head: ControlHeadConfig = field(default_factory=ControlHeadConfig)
     control_level_idx: int = 1
     imitation_loss_weight: float = 1.0
+    observation_shapes: Dict[str, tuple] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         assert len(self.level_configs) >= 2, "Need at least 2 PC levels"
@@ -80,6 +87,7 @@ def resolve_config_dims(
         control_head=config.control_head,
         control_level_idx=config.control_level_idx,
         imitation_loss_weight=config.imitation_loss_weight,
+        observation_shapes={k: env_obs_shapes[k] for k in config.observation_keys},
     )
 
 
@@ -105,6 +113,11 @@ DEFAULT_CONFIG = ModelConfig(
             d_representation=32,
             ssm=SSMConfig(d_state=16, dt_min=0.01, dt_max=0.1),
             prediction_head_hidden=[16],
+            objective_enabled=True,
+            objective_observable_key="lateral_deviation",
+            objective_target_value=0.0,
+            objective_ae_weight=1.0,
+            objective_task_weight=0.1,
         ),
     ],
     control_head=ControlHeadConfig(hidden_dims=[16, 8], output_dim=2),

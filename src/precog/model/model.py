@@ -48,7 +48,9 @@ class HierarchicalPCWorldModel(nn.Module):
             prev_dim = level_cfg.d_representation
 
         ctrl_cfg = config.control_head
-        control_input_dim = config.level_configs[config.control_level_idx].d_representation
+        control_input_dim = config.level_configs[
+            config.control_level_idx
+        ].d_representation
 
         self.control_head = ControlHead(
             input_dim=control_input_dim,
@@ -108,7 +110,7 @@ class HierarchicalPCWorldModel(nn.Module):
         curr = z_level
         for i, level in enumerate(self.levels):
             z_below_inputs.append(curr)
-            z_seq, pred_below_seq, h_new, epsilon, sigreg_loss = level.forward(
+            z_seq, pred_below_seq, h_new, epsilon, sigreg_loss, _ = level.forward(
                 curr, hidden_states[i], None
             )
             h_new_list.append(h_new)

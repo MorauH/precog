@@ -121,12 +121,15 @@ observations:
 #
 transforms:
   - best_path_relative_sampling
+  - lateral_deviation
 
 # Keys that transforms add to the snapshot, with their output shapes.
 # Used by the model-config resolution layer to derive modality input_dim.
 transform_output_keys:
   best_path_relative_sampling:
     shape: [1, 18]
+  lateral_deviation:
+    shape: [1, 1]
 
 actions:
   - key: steering

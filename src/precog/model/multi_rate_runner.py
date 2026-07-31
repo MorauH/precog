@@ -59,6 +59,14 @@ class MultiRateRunner:
         self._online_learning = runner_cfg.online_learning
         self._ctrl_weight = runner_cfg.imitation_loss_weight
 
+        ch = self.model.control_head
+        if ch.output_scales is not None:
+            self._action_scales = ch.output_scales.to(self.device)
+        else:
+            self._action_scales = torch.ones(
+                self.model.config.control_dim, device=self.device
+            )
+
         ctrl_idx = self.model.control_level_idx
         for i, level in enumerate(self.model.levels):
             param_groups = [{"params": level.parameters()}]
@@ -294,7 +302,7 @@ class MultiRateRunner:
                 value = torch.zeros(self.cfg.batch_size, shape[-1], device=self.device)
             parts.append(value)
         if prev_action is not None:
-            parts.append(prev_action)
+            parts.append(prev_action / self._action_scales)
         else:
             parts.append(
                 torch.zeros(

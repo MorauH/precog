@@ -122,6 +122,7 @@ observations:
 transforms:
   - best_path_relative_sampling
   - lateral_deviation
+  - normalize_observations
 
 # Keys that transforms add to the snapshot, with their output shapes.
 # Used by the model-config resolution layer to derive modality input_dim.

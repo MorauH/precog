@@ -236,3 +236,29 @@ def _lateral_deviation(snapshot: dict) -> dict:
     # shape [1, 18] → slice y of first waypoint (index 1) → [1, 1]
     snapshot[OUT_TOPIC] = path[:, 1:2]
     return snapshot
+
+
+@transform("normalize_observations")
+def _normalize_observations(snapshot: dict) -> dict:
+    """Apply fixed per-dimension scaling to keep model inputs ~[-1, 1].
+
+    Scales are vehicle/track design parameters, not learned:
+      - current_steering: actuator limit 0.5 rad
+      - best_path_relative_sampling: x 50 m (lookahead), y 10 m (half track)
+      - lateral_deviation: 10 m (half track width)
+    """
+    _SCALES = {
+        "current_steering": [0.5],
+        "best_path_relative_sampling": [
+            50.0 if i % 2 == 0 else 10.0 for i in range(18)
+        ],
+        "lateral_deviation": [10.0],
+    }
+
+    for key, scales in _SCALES.items():
+        value = snapshot.get(key)
+        if value is None:
+            continue
+        s = torch.as_tensor(scales, device=value.device, dtype=value.dtype)
+        snapshot[key] = value / s
+    return snapshot

@@ -1,5 +1,4 @@
 import argparse
-from enum import Enum, auto
 from typing import Optional
 
 import numpy as np
@@ -15,11 +14,6 @@ from precog.model.diagnostics import DiagnosticsCollector, DiagnosticsConfig
 
 
 ENV_CONFIG_PATH = "./src/precog/envs/ros/env_config.yaml"
-
-
-class OperationMode(Enum):
-    DRIVE = auto()
-    IMITATE = auto()
 
 
 def _action_to_dict(tensor: torch.Tensor, keys: list[str]) -> dict[str, np.ndarray]:
@@ -113,12 +107,10 @@ def main():
         print(f"  Dashboard: http://localhost:{args.dashboard_port}")
 
     obs = env.reset()
-    prev_action: Optional[torch.Tensor] = None
-    mode = OperationMode.IMITATE
 
-    print(f"\n  Starting in {mode.name} mode")
+    print(f"\n  Starting")
     if dashboard:
-        print(f"  Use the dashboard to control blend ratio and mode")
+        print(f"  Use the dashboard to control blend ratio")
     else:
         print(f"  Ctrl+C to quit")
     print()
@@ -140,30 +132,22 @@ def main():
                     blend_acc = new_acc
                     source_selector.blend_ratio_acc = blend_acc
 
-                dash_mode = ctrl.mode_safe
-                if dash_mode == "IMITATE" and mode == OperationMode.DRIVE:
-                    mode = OperationMode.IMITATE
-                    print(f"\n  >>> dashboard: switched to IMITATE mode\n", flush=True)
-                elif dash_mode == "DRIVE" and mode == OperationMode.IMITATE:
-                    mode = OperationMode.DRIVE
-                    print(f"\n  >>> dashboard: switched to DRIVE mode\n", flush=True)
-                    ctrl.set_mode("DRIVE")
-
             expert_action = _action_from_obs(obs, action_keys, device)
 
-            if mode == OperationMode.IMITATE:
+            if source_selector.last_output_valid:
+                prev_action = torch.tensor(
+                    [[source_selector.last_steer, source_selector.last_acc]],
+                    dtype=torch.float32, device=device,
+                )
+            elif expert_action is not None:
                 prev_action = expert_action
-            elif prev_action is None and expert_action is not None:
-                prev_action = expert_action
+            else:
+                prev_action = torch.zeros(1, config.control_dim, dtype=torch.float32, device=device)
 
             result = runner.tick(obs, prev_action, diagnostics=diagnostics)
 
-            if mode == OperationMode.IMITATE:
-                obs = env.step({})
-            else:
-                act_dict = _action_to_dict(result.action, action_keys)
-                obs = env.step(act_dict)
-                prev_action = result.action
+            act_dict = _action_to_dict(result.action, action_keys)
+            obs = env.step(act_dict)
 
             tick_count += 1
 
@@ -183,7 +167,6 @@ def main():
                     {
                         "tick": tick_count,
                         "tick_rate": diagnostics.tick_rate,
-                        "mode": mode.name,
                         "blend_ratio_steer": dashboard.controls.blend_steer_safe,
                         "blend_ratio_acc": dashboard.controls.blend_acc_safe,
                         "action": ma,
@@ -214,7 +197,7 @@ def main():
                     model_str = ", ".join(f"{v:.4f}" for v in ma)
                     prev_str = ", ".join(f"{v:.4f}" for v in pa)
                     print(
-                        f"\n  tick={tick_count}  hz={hz:5.1f}  mode={mode.name}  "
+                        f"\n  tick={tick_count}  hz={hz:5.1f}  "
                         f"blend/s={blend_steer:.2f} blend/a={blend_acc:.2f}  "
                         f"model=[{model_str}]  prev=[{prev_str}]"
                     )
@@ -228,7 +211,7 @@ def main():
                 model_str = ", ".join(f"{v:.4f}" for v in ma)
                 prev_str = ", ".join(f"{v:.4f}" for v in pa)
                 print(
-                    f"\n  tick={tick_count}  mode={mode.name}  "
+                    f"\n  tick={tick_count}  "
                     f"model=[{model_str}]  prev=[{prev_str}]"
                 )
                 print(diagnostics.report(), flush=True)
@@ -243,7 +226,6 @@ def main():
             dashboard.stop()
         source_selector.close()
         env.close()
-        rclpy.shutdown()
 
 
 if __name__ == "__main__":

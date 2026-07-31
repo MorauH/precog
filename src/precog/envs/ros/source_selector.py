@@ -54,6 +54,10 @@ class SourceSelector(Node):
         super().__init__("source_selector")
 
         self._lock = threading.Lock()
+        self._last_output_steer: float = 0.0
+        self._last_output_acc: float = 0.0
+        self._last_output_valid: bool = False
+
         self._blend_ratio_steer: float = 0.0
         self._blend_ratio_acc: float = 0.0
 
@@ -116,6 +120,21 @@ class SourceSelector(Node):
         with self._lock:
             self._blend_ratio_acc = max(0.0, min(1.0, float(value)))
 
+    @property
+    def last_steer(self) -> float:
+        with self._lock:
+            return self._last_output_steer
+
+    @property
+    def last_acc(self) -> float:
+        with self._lock:
+            return self._last_output_acc
+
+    @property
+    def last_output_valid(self) -> bool:
+        with self._lock:
+            return self._last_output_valid
+
     def snapshot(self) -> dict:
         with self._lock:
             return {
@@ -125,6 +144,8 @@ class SourceSelector(Node):
                 "auto_acc": self._auto_acc,
                 "precog_steer": self._precog_steer,
                 "precog_acc": self._precog_acc,
+                "blended_steer": self._last_output_steer,
+                "blended_acc": self._last_output_acc,
                 "stale": sorted(self._stale_warned),
             }
 
@@ -193,6 +214,10 @@ class SourceSelector(Node):
         else:
             acc_out = ratio_a * prec_a + (1.0 - ratio_a) * auto_a
         self._pub_acc.publish(Float32(data=float(acc_out)))
+
+        self._last_output_steer = float(steer_out)
+        self._last_output_acc = float(acc_out)
+        self._last_output_valid = True
 
         # Staleness check (log only)
         def _check(label: str, ts: float):

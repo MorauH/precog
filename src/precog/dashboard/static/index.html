@@ -33,11 +33,6 @@ canvas { width: 100%; height: 240px; }
 <h1>precog dashboard</h1>
 
 <div class="card">
-  <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
-    <span class="label" style="margin-bottom:0">Mode:</span>
-    <button id="btn_imitate" class="active">IMITATE</button>
-    <button id="btn_drive">DRIVE</button>
-  </div>
   <div class="blend-group">
     <span class="label">Steer blend</span>
     <input type="range" id="blend_steer" min="0" max="100" value="0" step="1">
@@ -48,7 +43,7 @@ canvas { width: 100%; height: 240px; }
     <input type="range" id="blend_acc" min="0" max="100" value="0" step="1">
     <span class="mono" id="blend_acc_label">0%</span>
   </div>
-  <div style="font-size:12px;color:var(--dim);margin-top:4px">0% = auto, 100% = precog (blend only active in DRIVE mode)</div>
+  <div style="font-size:12px;color:var(--dim);margin-top:4px">0% = auto, 100% = precog</div>
   <div id="status">connecting...</div>
 </div>
 
@@ -77,7 +72,6 @@ canvas { width: 100%; height: 240px; }
   <div class="grid">
     <div><div class="label">Tick rate</div><div class="value mono" id="m_hz">--</div></div>
     <div><div class="label">Tick count</div><div class="value mono" id="m_tick">--</div></div>
-    <div><div class="label">Mode</div><div class="value mono" id="m_mode">--</div></div>
     <div><div class="label">Blend steer</div><div class="value mono" id="m_blend_s">--</div></div>
     <div><div class="label">Blend acc</div><div class="value mono" id="m_blend_a">--</div></div>
   </div>
@@ -133,19 +127,11 @@ const blendSteerSlider = document.getElementById('blend_steer');
 const blendAccSlider = document.getElementById('blend_acc');
 const blendSteerLabel = document.getElementById('blend_steer_label');
 const blendAccLabel = document.getElementById('blend_acc_label');
-const btnImitate = document.getElementById('btn_imitate');
-const btnDrive = document.getElementById('btn_drive');
-let currentMode = 'IMITATE';
 
 function vals(dp) { return Array.isArray(dp) ? dp : [dp, 0]; }
 
 function makeBlendHandler(slider, label, cmdKey) {
   slider.addEventListener('input', () => {
-    if (currentMode !== 'DRIVE') {
-      slider.value = 0;
-      label.textContent = '0% (IMITATE)';
-      return;
-    }
     const v = parseInt(slider.value) / 100;
     label.textContent = Math.round(v * 100) + '%';
     const cmd = {}; cmd[cmdKey] = v;
@@ -155,33 +141,6 @@ function makeBlendHandler(slider, label, cmdKey) {
 
 makeBlendHandler(blendSteerSlider, blendSteerLabel, 'set_blend_steer');
 makeBlendHandler(blendAccSlider, blendAccLabel, 'set_blend_acc');
-
-btnImitate.addEventListener('click', () => send({ set_mode: 'IMITATE' }));
-btnDrive.addEventListener('click', () => send({ set_mode: 'DRIVE' }));
-
-let lastBlendSteer = 0;
-let lastBlendAcc = 0;
-function updateModeUI(mode) {
-  const isNewMode = currentMode !== mode;
-  currentMode = mode;
-  btnImitate.className = mode === 'IMITATE' ? 'active' : '';
-  btnDrive.className = mode === 'DRIVE' ? 'active' : '';
-  if (mode === 'IMITATE') {
-    lastBlendSteer = parseInt(blendSteerSlider.value) / 100;
-    lastBlendAcc = parseInt(blendAccSlider.value) / 100;
-    blendSteerSlider.value = 0;
-    blendAccSlider.value = 0;
-    [blendSteerSlider, blendAccSlider].forEach(s => s.style.opacity = '0.4');
-    blendSteerLabel.textContent = '0% (auto only)';
-    blendAccLabel.textContent = '0% (auto only)';
-  } else if (isNewMode) {
-    blendSteerSlider.value = Math.round(lastBlendSteer * 100);
-    blendAccSlider.value = Math.round(lastBlendAcc * 100);
-    [blendSteerSlider, blendAccSlider].forEach(s => s.style.opacity = '');
-    blendSteerLabel.textContent = Math.round(lastBlendSteer * 100) + '%';
-    blendAccLabel.textContent = Math.round(lastBlendAcc * 100) + '%';
-  }
-}
 
 let ws;
 
@@ -211,22 +170,18 @@ function pushData(chart, dataArr, ds0, ds1) {
 }
 
 function updateUI(d) {
-  if (currentMode === 'DRIVE') {
-    if (d.blend_ratio_steer !== undefined) {
-      const pct = Math.round(d.blend_ratio_steer * 100);
-      blendSteerSlider.value = pct;
-      blendSteerLabel.textContent = pct + '%';
-    }
-    if (d.blend_ratio_acc !== undefined) {
-      const pct = Math.round(d.blend_ratio_acc * 100);
-      blendAccSlider.value = pct;
-      blendAccLabel.textContent = pct + '%';
-    }
+  if (d.blend_ratio_steer !== undefined) {
+    const pct = Math.round(d.blend_ratio_steer * 100);
+    blendSteerSlider.value = pct;
+    blendSteerLabel.textContent = pct + '%';
   }
-  if (d.mode) updateModeUI(d.mode);
+  if (d.blend_ratio_acc !== undefined) {
+    const pct = Math.round(d.blend_ratio_acc * 100);
+    blendAccSlider.value = pct;
+    blendAccLabel.textContent = pct + '%';
+  }
   if (d.tick_rate !== undefined) document.getElementById('m_hz').textContent = d.tick_rate.toFixed(1) + ' Hz';
   if (d.tick !== undefined) document.getElementById('m_tick').textContent = d.tick;
-  if (d.mode) document.getElementById('m_mode').textContent = d.mode;
   if (d.blend_ratio_steer !== undefined) document.getElementById('m_blend_s').textContent = Math.round(d.blend_ratio_steer * 100) + '%';
   if (d.blend_ratio_acc !== undefined) document.getElementById('m_blend_a').textContent = Math.round(d.blend_ratio_acc * 100) + '%';
 

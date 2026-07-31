@@ -23,7 +23,6 @@ class Controls:
 
     blend_steer: float = 0.0
     blend_acc: float = 0.0
-    mode: str = "IMITATE"
 
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -35,13 +34,6 @@ class Controls:
         with self._lock:
             self.blend_acc = max(0.0, min(1.0, float(value)))
 
-    def set_mode(self, value: str):
-        value = value.upper()
-        if value not in ("IMITATE", "DRIVE"):
-            return
-        with self._lock:
-            self.mode = value
-
     @property
     def blend_steer_safe(self) -> float:
         with self._lock:
@@ -51,11 +43,6 @@ class Controls:
     def blend_acc_safe(self) -> float:
         with self._lock:
             return self.blend_acc
-
-    @property
-    def mode_safe(self) -> str:
-        with self._lock:
-            return self.mode
 
 
 class DashboardServer:
@@ -183,8 +170,6 @@ class DashboardServer:
             self._controls.set_blend_steer(cmd["set_blend_steer"])
         if "set_blend_acc" in cmd:
             self._controls.set_blend_acc(cmd["set_blend_acc"])
-        if "set_mode" in cmd:
-            self._controls.set_mode(cmd["set_mode"])
 
     # ------------------------------------------------------------------ #
     # Internal

@@ -1,10 +1,4 @@
-import sys
-import select
-import termios
-import tty
 import argparse
-import threading
-import queue
 from enum import Enum, auto
 from typing import Optional
 
@@ -26,42 +20,6 @@ ENV_CONFIG_PATH = "./src/precog/envs/ros/env_config.yaml"
 class OperationMode(Enum):
     DRIVE = auto()
     IMITATE = auto()
-
-
-class KeyboardReader:
-    def __init__(self):
-        self._queue: queue.Queue[str] = queue.Queue()
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-
-    def _read_loop(self):
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while self._running:
-                readable, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if readable:
-                    ch = sys.stdin.read(1)
-                    if ch == "\x03":
-                        raise KeyboardInterrupt
-                    self._queue.put(ch)
-        finally:
-            termios.tcsetattr(fd, termios.TCSANOW, old)
-
-    def get(self) -> Optional[str]:
-        try:
-            return self._queue.get_nowait()
-        except queue.Empty:
-            return None
 
 
 def _action_to_dict(tensor: torch.Tensor, keys: list[str]) -> dict[str, np.ndarray]:
@@ -89,9 +47,9 @@ def _action_from_obs(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--dashboard",
+        "--headless",
         action="store_true",
-        help="Enable the web dashboard on port 8080",
+        help="Disable the web dashboard",
     )
     parser.add_argument(
         "--dashboard-port",
@@ -147,16 +105,12 @@ def main():
     )
 
     dashboard = None
-    kb: Optional[KeyboardReader] = None
-    if args.dashboard:
+    if not args.headless:
         from precog.dashboard import DashboardServer
 
         dashboard = DashboardServer(port=args.dashboard_port)
         dashboard.start()
         print(f"  Dashboard: http://localhost:{args.dashboard_port}")
-    else:
-        kb = KeyboardReader()
-        kb.start()
 
     obs = env.reset()
     prev_action: Optional[torch.Tensor] = None
@@ -166,7 +120,7 @@ def main():
     if dashboard:
         print(f"  Use the dashboard to control blend ratio and mode")
     else:
-        print(f"  [m] toggle mode  |  Ctrl+C to quit")
+        print(f"  Ctrl+C to quit")
     print()
 
     tick_count = 0
@@ -175,15 +129,6 @@ def main():
 
     try:
         while rclpy.ok():
-            if kb is not None:
-                ch = kb.get()
-                if ch == "m":
-                    if mode == OperationMode.IMITATE:
-                        mode = OperationMode.DRIVE
-                    else:
-                        mode = OperationMode.IMITATE
-                    print(f"\n  >>> switched to {mode.name} mode\n", flush=True)
-
             if dashboard is not None:
                 ctrl = dashboard.controls
                 new_steer = ctrl.blend_steer_safe
@@ -296,8 +241,6 @@ def main():
         diagnostics.close()
         if dashboard is not None:
             dashboard.stop()
-        if kb is not None:
-            kb.stop()
         source_selector.close()
         env.close()
         rclpy.shutdown()

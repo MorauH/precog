@@ -131,6 +131,7 @@ transform_output_keys:
   lateral_deviation:
     shape: [1, 1]
 
+# Our model output actions
 actions:
   - key: steering
     topic: /cmd/steer_precog
@@ -142,9 +143,7 @@ actions:
     msg_type: std_msgs/msg/Float32
     codec: float
 
-# Action topics mirrored as observations, so the model can read the expert's
-# commands in IMITATE mode.  Not required — only populated when the expert is
-# actively publishing (i.e. IMITATE mode).
+# External "expert" actions
 expert_action_observations:
   - key: expert_steering
     topic: /cmd/steer_auto

@@ -153,15 +153,11 @@ def main():
 
             if dashboard is not None and tick_count % 10 == 0:
                 ma = result.action[0].tolist()
-                pa = (
-                    prev_action[0].tolist()
-                    if prev_action is not None
-                    else [float("nan")] * len(action_keys)
-                )
+                pa = prev_action[0].tolist()
                 ea = (
                     expert_action[0].tolist()
                     if expert_action is not None
-                    else [float("nan")] * len(action_keys)
+                    else [None] * len(action_keys)
                 )
                 dashboard.update(
                     {
@@ -189,25 +185,22 @@ def main():
                 if tick_count % 200 == 0:
                     hz = diagnostics.tick_rate
                     ma = result.action[0].tolist()
-                    pa = (
-                        prev_action[0].tolist()
-                        if prev_action is not None
-                        else [float("nan")] * len(action_keys)
-                    )
+                    pa = prev_action[0].tolist()
                     model_str = ", ".join(f"{v:.4f}" for v in ma)
                     prev_str = ", ".join(f"{v:.4f}" for v in pa)
+                    ea_str = (
+                        ", ".join(f"{v:.4f}" for v in expert_action[0].tolist())
+                        if expert_action is not None
+                        else "None"
+                    )
                     print(
                         f"\n  tick={tick_count}  hz={hz:5.1f}  "
                         f"blend/s={blend_steer:.2f} blend/a={blend_acc:.2f}  "
-                        f"model=[{model_str}]  prev=[{prev_str}]"
+                        f"model=[{model_str}]  prev=[{prev_str}]  expert=[{ea_str}]"
                     )
             elif diagnostics.should_report():
                 ma = result.action[0].tolist()
-                pa = (
-                    prev_action[0].tolist()
-                    if prev_action is not None
-                    else [float("nan")] * len(action_keys)
-                )
+                pa = prev_action[0].tolist()
                 model_str = ", ".join(f"{v:.4f}" for v in ma)
                 prev_str = ", ".join(f"{v:.4f}" for v in pa)
                 print(
@@ -226,6 +219,7 @@ def main():
             dashboard.stop()
         source_selector.close()
         env.close()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

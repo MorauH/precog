@@ -72,8 +72,11 @@ canvas { width: 100%; height: 240px; }
   <div class="grid">
     <div><div class="label">Tick rate</div><div class="value mono" id="m_hz">--</div></div>
     <div><div class="label">Tick count</div><div class="value mono" id="m_tick">--</div></div>
+    <div><div class="label">WS msgs</div><div class="value mono" id="m_msg">0</div></div>
     <div><div class="label">Blend steer</div><div class="value mono" id="m_blend_s">--</div></div>
     <div><div class="label">Blend acc</div><div class="value mono" id="m_blend_a">--</div></div>
+    <div><div class="label">Expert steer</div><div class="value mono" id="m_expert_s">--</div></div>
+    <div><div class="label">Expert acc</div><div class="value mono" id="m_expert_a">--</div></div>
   </div>
 </div>
 
@@ -99,8 +102,8 @@ function makeChartData(ds1Label, ds1Color, ds2Label, ds2Color) {
   ]};
 }
 
-const steerData = makeChartData('model steer', '#58a6ff', 'expert steer', '#8b949e');
-const accData   = makeChartData('model acc', '#3fb950', 'expert acc', '#6e7681');
+const steerData = makeChartData('model', '#58a6ff', 'expert', '#8b949e');
+const accData   = makeChartData('model', '#3fb950', 'expert', '#6e7681');
 const surpriseData = { labels: [], datasets: [
   { label: 'L0', borderColor: '#58a6ff', data: [], tension: 0.1, pointRadius: 0 },
   { label: 'L1', borderColor: '#d2991d', data: [], tension: 0.1, pointRadius: 0 },
@@ -143,6 +146,7 @@ makeBlendHandler(blendSteerSlider, blendSteerLabel, 'set_blend_steer');
 makeBlendHandler(blendAccSlider, blendAccLabel, 'set_blend_acc');
 
 let ws;
+let msgCount = 0;
 
 function send(cmd) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -155,7 +159,16 @@ function connect() {
   ws = new WebSocket(proto + '//' + location.host + '/ws');
   ws.onopen = () => { statusEl.textContent = 'connected'; statusEl.className = ''; };
   ws.onclose = () => { statusEl.textContent = 'disconnected — reconnecting...'; statusEl.className = 'disconnected'; setTimeout(connect, 1000); };
-  ws.onmessage = (ev) => { try { updateUI(JSON.parse(ev.data)); } catch(e) {} };
+  ws.onmessage = (ev) => {
+    try {
+      updateUI(JSON.parse(ev.data));
+      statusEl.textContent = 'connected';
+      statusEl.className = '';
+    } catch(e) {
+      statusEl.textContent = 'js error: ' + e.message;
+      statusEl.className = 'disconnected';
+    }
+  };
 }
 
 function pushData(chart, dataArr, ds0, ds1) {
@@ -170,6 +183,8 @@ function pushData(chart, dataArr, ds0, ds1) {
 }
 
 function updateUI(d) {
+  msgCount += 1;
+  document.getElementById('m_msg').textContent = msgCount;
   if (d.blend_ratio_steer !== undefined) {
     const pct = Math.round(d.blend_ratio_steer * 100);
     blendSteerSlider.value = pct;
@@ -184,6 +199,11 @@ function updateUI(d) {
   if (d.tick !== undefined) document.getElementById('m_tick').textContent = d.tick;
   if (d.blend_ratio_steer !== undefined) document.getElementById('m_blend_s').textContent = Math.round(d.blend_ratio_steer * 100) + '%';
   if (d.blend_ratio_acc !== undefined) document.getElementById('m_blend_a').textContent = Math.round(d.blend_ratio_acc * 100) + '%';
+  if (d.expert_action !== undefined) {
+    const fmtEx = function(v) { return v === null ? '--' : (typeof v === 'number' ? v.toFixed(4) : String(v)); };
+    document.getElementById('m_expert_s').textContent = fmtEx(d.expert_action[0]);
+    document.getElementById('m_expert_a').textContent = fmtEx(d.expert_action[1]);
+  }
 
   if (d.source_selector) {
     const ss = d.source_selector;

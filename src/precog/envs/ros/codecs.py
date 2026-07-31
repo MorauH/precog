@@ -221,6 +221,18 @@ def _best_path_relative_sampling(snapshot: dict) -> dict:
     return snapshot
 
 
+@transform("forward_speed")
+def _forward_speed(snapshot: dict) -> dict:
+    """Extract forward speed (linear_velocity.x) from car_state."""
+    OUT_TOPIC = "forward_speed"
+    car_state = snapshot.get("car_state")
+    if car_state is None:
+        snapshot[OUT_TOPIC] = None
+        return snapshot
+    snapshot[OUT_TOPIC] = car_state[:, 0:1]
+    return snapshot
+
+
 @transform("lateral_deviation")
 def _lateral_deviation(snapshot: dict) -> dict:
     """Extract lateral path deviation from best_path_relative_sampling.

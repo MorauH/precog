@@ -193,9 +193,12 @@ def main():
                         if expert_action is not None
                         else "None"
                     )
+                    fs = obs.get("forward_speed")
+                    speed_str = f"{fs.item():.2f}" if fs is not None else "N/A"
                     print(
                         f"\n  tick={tick_count}  hz={hz:5.1f}  "
                         f"blend/s={blend_steer:.2f} blend/a={blend_acc:.2f}  "
+                        f"speed={speed_str}  "
                         f"model=[{model_str}]  prev=[{prev_str}]  expert=[{ea_str}]"
                     )
             elif diagnostics.should_report():

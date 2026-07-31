@@ -109,6 +109,11 @@ DEFAULT_CONFIG = ModelConfig(
             d_representation=32,
             ssm=SSMConfig(d_state=16, dt_min=0.001, dt_max=0.01),
             prediction_head_hidden=[16],
+            objective_enabled=True,
+            objective_observable_key="forward_speed",
+            objective_target_value=5.0,
+            objective_ae_weight=1.0,
+            objective_task_weight=0.1,
         ),
         PCLevelConfig(
             d_representation=32,

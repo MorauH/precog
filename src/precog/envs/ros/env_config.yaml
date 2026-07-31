@@ -34,13 +34,13 @@ observations:
     max_age_sec: 0.2
     required: true
 
-  #- key: car_state
-  #  topic: /ekf/car_state #/sim?
-  #  msg_type: cfs_msgs/msg/StateEstimation
-  #  codec: car_state
-  #  shape: [1, 13]
-  #  max_age_sec: 0.1
-  #  required: true
+  - key: car_state
+    topic: /ekf/car_state
+    msg_type: cfs_msgs/msg/StateEstimation
+    codec: car_state
+    shape: [1, 13]
+    max_age_sec: 0.1
+    required: true
 
   - key: car_pose
     topic: /graphslam/pose
@@ -122,6 +122,7 @@ observations:
 transforms:
   - best_path_relative_sampling
   - lateral_deviation
+  - forward_speed
   - normalize_observations
 
 # Keys that transforms add to the snapshot, with their output shapes.
@@ -130,6 +131,8 @@ transform_output_keys:
   best_path_relative_sampling:
     shape: [1, 18]
   lateral_deviation:
+    shape: [1, 1]
+  forward_speed:
     shape: [1, 1]
 
 # Our model output actions

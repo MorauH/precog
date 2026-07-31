@@ -21,15 +21,13 @@ from typing import Dict, List, Optional
 
 import torch
 
+from precog.messaging import WeightSync
 from precog.model import (
     DEFAULT_CONFIG,
-    ForwardOutput,
     HierarchicalPCWorldModel,
     PerLevelSnapshot,
     replay_learn_level,
 )
-from precog.model.config import ModelConfig
-from precog.messaging import WeightSync
 
 
 def run_learner(

@@ -57,16 +57,6 @@ def deserialize_to_model(
     model_layer.load_state_dict(state_dict, strict=False)
 
 
-def clone_params_to_cpu(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
-    """Extract a CPU copy of module parameters as a state_dict-like dict."""
-    state = {}
-    for name, param in module.named_parameters():
-        state[name] = param.data.detach().cpu().clone()
-    for name, buf in module.named_buffers():
-        state[name] = buf.data.detach().cpu().clone()
-    return state
-
-
 class WeightSync:
     """Double-buffered weight synchronisation for one model level.
 
@@ -90,21 +80,6 @@ class WeightSync:
 
         self._data_len_a = multiprocessing.Value("I", 0, lock=False)
         self._data_len_b = multiprocessing.Value("I", 0, lock=False)
-
-    @classmethod
-    def attach(cls, name: str, level_idx: int) -> "WeightSync":
-        """Attach to an existing WeightSync channel from another process."""
-        ws = cls.__new__(cls)
-        ws._name = name
-        ws._level_idx = level_idx
-        ws._buffer_a = multiprocessing.Array("B", 1024 * 1024, lock=False)
-        ws._buffer_b = multiprocessing.Array("B", 1024 * 1024, lock=False)
-        ws._active_idx = multiprocessing.Value("I", 0, lock=False)
-        ws._version_a = multiprocessing.Value("Q", 0, lock=False)
-        ws._version_b = multiprocessing.Value("Q", 0, lock=False)
-        ws._data_len_a = multiprocessing.Value("I", 0, lock=False)
-        ws._data_len_b = multiprocessing.Value("I", 0, lock=False)
-        return ws
 
     @property
     def name(self) -> str:

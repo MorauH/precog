@@ -192,30 +192,6 @@ class HierarchicalPCWorldModel(nn.Module):
                 state[f"control_head.{name}"] = buf.data.detach().cpu().clone()
         return state
 
-    def set_weights(
-        self, level_idx: int, weights: dict[str, torch.Tensor]
-    ) -> None:
-        """Load weights into the level and optionally the control head."""
-        if level_idx < 0 or level_idx >= len(self.levels):
-            raise ValueError(f"Invalid level_idx {level_idx}")
-        for name, param in self.levels[level_idx].named_parameters():
-            key = f"level.{name}"
-            if key in weights:
-                param.data.copy_(weights[key].to(param.device))
-        for name, buf in self.levels[level_idx].named_buffers():
-            key = f"level.{name}"
-            if key in weights:
-                buf.data.copy_(weights[key].to(buf.device))
-        if level_idx == self.control_level_idx:
-            for name, param in self.control_head.named_parameters():
-                key = f"control_head.{name}"
-                if key in weights:
-                    param.data.copy_(weights[key].to(param.device))
-            for name, buf in self.control_head.named_buffers():
-                key = f"control_head.{name}"
-                if key in weights:
-                    buf.data.copy_(weights[key].to(buf.device))
-
     # ------------------------------------------------------------------ #
     # Multi-rate runner factory
     # ------------------------------------------------------------------ #

@@ -29,9 +29,6 @@ _READER_SPIN_US = 50
 _READER_SPIN_ITERATIONS = 10
 _READER_RETRY_COUNT = 16
 
-_CAS_LOOP_DELAY_US = 5
-
-
 def _time_us() -> float:
     return time.perf_counter() * 1_000_000
 
@@ -141,90 +138,4 @@ class ShmTensorSlot:
         self._shm.close()
         self._shm.unlink()
 
-    def writer_proxy(self) -> _ShmSlotWriter:
-        """Return a lightweight writer proxy for use in child processes."""
-        return _ShmSlotWriter(
-            shm_name=self._shm_name,
-            shape=self._shape,
-            dtype=self._dtype,
-            gen=self._gen,
-        )
-
-    def reader_proxy(self) -> _ShmSlotReader:
-        """Return a lightweight reader proxy for use in child processes."""
-        return _ShmSlotReader(
-            shm_name=self._shm_name,
-            shape=self._shape,
-            dtype=self._dtype,
-            gen=self._gen,
-        )
-
-
-class _ShmSlotWriter:
-    """Lightweight writer handle for use in child processes."""
-
-    def __init__(self, shm_name: str, shape: tuple[int, ...], dtype: np.dtype,
-                 gen: multiprocessing.Value):
-        self._shm = SharedMemory(name=shm_name)
-        self._shape = shape
-        self._dtype = dtype
-        self._gen = gen
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return self._shape
-
-    def write(self, tensor: torch.Tensor) -> None:
-        tensor = tensor.detach().cpu().contiguous()
-        arr = np.ndarray(self._shape, dtype=self._dtype, buffer=self._shm.buf)
-
-        for _ in range(_WRITER_RETRY_COUNT):
-            gen = _atomic_cas_increment(self._gen)
-            np.copyto(arr, tensor.numpy().reshape(self._shape))
-            _atomic_cas_increment(self._gen)
-            return
-
-    def close(self) -> None:
-        self._shm.close()
-
-
-class _ShmSlotReader:
-    """Lightweight reader handle for use in child processes."""
-
-    def __init__(self, shm_name: str, shape: tuple[int, ...], dtype: np.dtype,
-                 gen: multiprocessing.Value):
-        self._shm = SharedMemory(name=shm_name)
-        self._shape = shape
-        self._dtype = dtype
-        self._gen = gen
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return self._shape
-
-    def read(self, timeout_us: float = 5000) -> Optional[torch.Tensor]:
-        arr = np.ndarray(self._shape, dtype=self._dtype, buffer=self._shm.buf)
-        deadline = _time_us() + timeout_us
-
-        for _ in range(_READER_RETRY_COUNT):
-            for __ in range(_READER_SPIN_ITERATIONS):
-                if _time_us() >= deadline:
-                    return None
-
-                gen_0 = self._gen.value
-                if gen_0 & 1:
-                    time.sleep(0)
-                    continue
-
-                result = arr.copy()
-                gen_1 = self._gen.value
-
-                if gen_0 == gen_1 and not (gen_0 & 1):
-                    return torch.from_numpy(result).clone()
-
-            os.sched_yield()
-
-        return None
-
-    def close(self) -> None:
-        self._shm.close()
+    pass

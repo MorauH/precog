@@ -22,7 +22,6 @@ from typing import List, Optional
 import torch
 
 from precog.messaging import (
-    PerLevelSnapshot,
     ShmTensorSlot,
     WeightSync,
 )
@@ -30,6 +29,7 @@ from precog.model import (
     ClockConfig,
     HierarchicalClock,
     PCLevel,
+    PerLevelSnapshot,
 )
 from precog.model.config import PCLevelConfig
 

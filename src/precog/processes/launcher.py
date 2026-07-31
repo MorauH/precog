@@ -187,6 +187,7 @@ class Launcher:
         self._l0_process: Optional[multiprocessing.Process] = None
         self._learner_process: Optional[multiprocessing.Process] = None
         self._upper_processes: List[multiprocessing.Process] = []
+        self._upper_level_kwargs: List[Dict[str, Any]] = []
 
         self._experience_queues: List[multiprocessing.Queue] = []
         self._weight_syncs: List[WeightSync] = []
@@ -350,6 +351,8 @@ class Launcher:
                 "device": self._device,
             }
 
+            self._upper_level_kwargs.append(kwargs)
+
             proc = ctx.Process(
                 target=_worker_level_n,
                 kwargs=kwargs,
@@ -462,7 +465,24 @@ class Launcher:
         print(f"[Launcher] Learner process restarted (pid={self._learner_process.pid})")
 
     def _restart_upper_level(self, idx: int) -> None:
-        print(f"[Launcher] Upper level restart not yet implemented for idx={idx}")
+        if idx >= len(self._upper_level_kwargs):
+            print(f"[Launcher] No saved kwargs for upper level idx={idx}")
+            return
+        ctx = multiprocessing.get_context("spawn")
+        kwargs = self._upper_level_kwargs[idx]
+        level_idx = kwargs["level_idx"]
+        proc = ctx.Process(
+            target=_worker_level_n,
+            kwargs=kwargs,
+            name=f"level{level_idx}",
+            daemon=True,
+        )
+        proc.start()
+        if idx < len(self._upper_processes):
+            self._upper_processes[idx] = proc
+        else:
+            self._upper_processes.append(proc)
+        print(f"[Launcher] L{level_idx} process restarted (pid={proc.pid})")
 
     def shutdown(self) -> None:
         """Stop all child processes gracefully."""

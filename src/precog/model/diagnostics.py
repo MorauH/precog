@@ -158,9 +158,6 @@ class DiagnosticsCollector:
             if process_time > self._proc_time_max:
                 self._proc_time_max = process_time
 
-        if self.cfg.detail_level == "light":
-            return
-
         for i in result.updated_levels:
             level = self.model.levels[i]
             state = result.level_states[i]
@@ -175,6 +172,9 @@ class DiagnosticsCollector:
             acc.surprise_sum += eps
             acc.surprise_min = min(acc.surprise_min, eps)
             acc.surprise_max = max(acc.surprise_max, eps)
+
+            if self.cfg.detail_level == "light":
+                continue
 
             # -- representation norms ----------------------------------------
             z: torch.Tensor = state.last_z  # (B, d_repr)

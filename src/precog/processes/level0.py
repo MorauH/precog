@@ -11,6 +11,7 @@ or blocked by Learner/upper-level processes.
 
 from __future__ import annotations
 
+import gc
 import multiprocessing
 import os
 import signal
@@ -29,7 +30,7 @@ from precog.model import (
     PerLevelSnapshot,
 )
 from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
-from precog.messaging import WeightSync
+from precog.messaging import ShmRingBuffer, WeightSync
 
 ENV_CONFIG_PATH = "./src/precog/envs/ros/env_config.yaml"
 
@@ -60,6 +61,7 @@ def _set_realtime(priority: int, core: Optional[int]) -> None:
     """Set SCHED_FIFO scheduling and optionally pin to a CPU core."""
     try:
         import os
+
         param = os.sched_param(priority)
         os.sched_setscheduler(0, os.SCHED_FIFO, param)
 
@@ -78,7 +80,7 @@ def _set_realtime(priority: int, core: Optional[int]) -> None:
 
 def run_level0(
     stop_event: multiprocessing.Event,
-    experience_queues: List[multiprocessing.Queue],
+    experience_rings: List[ShmRingBuffer],
     weight_syncs: List[WeightSync],
     *,
     headless: bool = True,
@@ -93,7 +95,7 @@ def run_level0(
 
     Args:
         stop_event: Set by launcher to request clean shutdown.
-        experience_queues: One Queue per level for experience → Learner.
+        experience_rings: One ShmRingBuffer per level for experience → Learner.
         weight_syncs: One WeightSync per level for Learner → params.
         headless: If False, start the web dashboard in a thread.
         dashboard_port: Port for the dashboard server.
@@ -144,6 +146,7 @@ def run_level0(
     if not headless:
         try:
             from precog.dashboard import DashboardServer
+
             dashboard = DashboardServer(port=dashboard_port)
             dashboard.start()
         except Exception:
@@ -154,6 +157,7 @@ def run_level0(
     upward_writer = None
     if upward_writer_proxy is not None:
         from precog.messaging import ShmTensorSlot
+
         name, shape, dtype_str = upward_writer_proxy
         dtype = np.dtype(dtype_str)
         upward_writer = ShmTensorSlot.attach(name, shape, dtype)
@@ -161,42 +165,27 @@ def run_level0(
     downward_reader = None
     if downward_reader_proxy is not None:
         from precog.messaging import ShmTensorSlot
+
         name, shape, dtype_str = downward_reader_proxy
         dtype = np.dtype(dtype_str)
         downward_reader = ShmTensorSlot.attach(name, shape, dtype)
 
-    if len(experience_queues) != len(model.levels):
-        raise RuntimeError(
-            f"experience_queues count {len(experience_queues)} != levels {len(model.levels)}"
-        )
-
-    print(f"[L0] Waiting for first weight sync ({len(weight_syncs)} levels)...")
-    for ws in weight_syncs:
-        level_idx = ws.level_idx
-        if level_idx == config.control_level_idx:
-            target = model.levels[level_idx]
-            started = time.monotonic()
-            while not stop_event.is_set():
-                if ws.read_latest(target, device=torch.device(device)):
-                    break
-                if time.monotonic() - started > 10.0:
-                    print(f"[L0] Weight sync timeout for level {level_idx}, using initial weights")
-                    break
-                time.sleep(0.001)
-        else:
-            started = time.monotonic()
-            while not stop_event.is_set():
-                if ws.read_latest(model.levels[level_idx], device=torch.device(device)):
-                    break
-                if time.monotonic() - started > 10.0:
-                    print(f"[L0] Weight sync timeout for level {level_idx}, using initial weights")
-                    break
-                time.sleep(0.001)
-    print("[L0] Weight sync complete, beginning control loop")
+    print("[L0] Starting with initial weights; weight sync is async")
 
     tick_count = 0
     blend_steer = 0.0
     blend_acc = 0.0
+
+    _last_tick_time = time.monotonic()
+    _hz = 0.0
+
+    weight_versions = {ws.level_idx: 0 for ws in weight_syncs}
+    _last_gc_collect = 0
+    _exp_write_interval = 2  # write experience every 2 ticks (~100Hz at 200Hz)
+
+    runner.clock.reset()
+
+    gc.disable()
 
     try:
         while rclpy.ok() and not stop_event.is_set():
@@ -216,7 +205,8 @@ def run_level0(
             if source_selector.last_output_valid:
                 prev_action = torch.tensor(
                     [[source_selector.last_steer, source_selector.last_acc]],
-                    dtype=torch.float32, device=device,
+                    dtype=torch.float32,
+                    device=device,
                 )
             elif expert_action is not None:
                 prev_action = expert_action
@@ -225,28 +215,86 @@ def run_level0(
                     1, config.control_dim, dtype=torch.float32, device=device
                 )
 
-            fwd: ForwardOutput = runner.forward(obs, prev_action)
+            # Read pred_from_above from L1 via downward slot (strictly non-blocking)
+            pred_from_above = None
+            if downward_reader is not None:
+                raw = downward_reader.read(timeout_us=0)
+                if raw is not None:
+                    pred_from_above = raw.to(torch.device(device))
 
+            # Level 0 forward pass only (no upper levels)
+            fwd: ForwardOutput = runner.forward_level0(
+                obs,
+                prev_action,
+                pred_from_above=pred_from_above,
+            )
+
+            # Send z0 upward to L1
             if upward_writer is not None and fwd.level_states:
                 z0 = fwd.level_states[0].last_z
                 if z0 is not None:
                     upward_writer.write(z0)
 
-            for snap in fwd.level_snapshots:
-                experience_queues[snap.level_idx].put(snap)
+            # Batch experience writes — not every tick, write every N ticks
+            if fwd.level_snapshots and tick_count % _exp_write_interval == 0:
+                experience_rings[0].write(fwd.level_snapshots[0])
 
-            for ws in weight_syncs:
-                level_idx = ws.level_idx
-                if level_idx == config.control_level_idx:
-                    ws.read_latest(model.levels[level_idx], device=torch.device(device))
-                else:
-                    ws.read_latest(model.levels[level_idx], device=torch.device(device))
-                if level_idx == config.control_level_idx:
-                    ws.read_latest(model.control_head, device=torch.device(device))
+            # Version-guarded weight sync — L0 only syncs its own level
+            # (L1 weights are synced by the L1 process)
+            if tick_count % 4 == 0:
+                ws = weight_syncs[0]
+                new_ver = ws.read_latest_if_new(
+                    model.levels[0],
+                    weight_versions[0],
+                    device=torch.device(device),
+                )
+                if new_ver != weight_versions[0]:
+                    weight_versions[0] = new_ver
+                    ws.read_latest(
+                        model.control_head,
+                        device=torch.device(device),
+                    )
+                    print(f"[L0] Updated weights (v{new_ver})")
+
+            now = time.monotonic()
+            _hz = 0.9 * _hz + 0.1 / max(now - _last_tick_time, 1e-6)
+            _last_tick_time = now
 
             act_dict = _action_to_dict(fwd.action, action_keys)
             obs = env.step(act_dict)
             tick_count += 1
+
+            if tick_count - _last_gc_collect > 20000:
+                gc.collect()
+                _last_gc_collect = tick_count
+
+            if dashboard is not None and tick_count % 10 == 0:
+                ma = fwd.action[0].tolist()
+                pa = prev_action[0].tolist()
+                ea = (
+                    expert_action[0].tolist()
+                    if expert_action is not None
+                    else [None] * len(action_keys)
+                )
+                surprise = []
+                for ls in fwd.level_states:
+                    if ls.last_pred_error is not None:
+                        surprise.append(ls.last_pred_error.pow(2).mean().item())
+                    else:
+                        surprise.append(0.0)
+                dashboard.update(
+                    {
+                        "tick": tick_count,
+                        "tick_rate": _hz,
+                        "blend_ratio_steer": dashboard.controls.blend_steer_safe,
+                        "blend_ratio_acc": dashboard.controls.blend_acc_safe,
+                        "action": ma,
+                        "prev_action": pa,
+                        "expert_action": ea,
+                        "source_selector": source_selector.snapshot(),
+                        "surprise": surprise,
+                    }
+                )
 
             if tick_count % 200 == 0:
                 ma = fwd.action[0].tolist()

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "precog"
 version = "0.1.0"
 requires-python = ">=3.13"
-scripts = { precog = "precog.main:main" }
+scripts = { precog = "precog.processes.cli:main" }
 dependencies = [
     "numpy",
     "mcap",

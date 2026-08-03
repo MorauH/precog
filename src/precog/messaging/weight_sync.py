@@ -67,19 +67,22 @@ class WeightSync:
         level_idx: Index of the level this sync channel serves.
     """
 
-    def __init__(self, name: str, level_idx: int):
+    def __init__(self, name: str, level_idx: int, *, mp_ctx=None):
         self._name = name
         self._level_idx = level_idx
 
-        self._buffer_a = multiprocessing.Array("B", 1024 * 1024, lock=False)
-        self._buffer_b = multiprocessing.Array("B", 1024 * 1024, lock=False)
+        if mp_ctx is None:
+            mp_ctx = multiprocessing
 
-        self._active_idx = multiprocessing.Value("I", 0, lock=False)
-        self._version_a = multiprocessing.Value("Q", 0, lock=False)
-        self._version_b = multiprocessing.Value("Q", 0, lock=False)
+        self._buffer_a = mp_ctx.Array("B", 1024 * 1024, lock=False)
+        self._buffer_b = mp_ctx.Array("B", 1024 * 1024, lock=False)
 
-        self._data_len_a = multiprocessing.Value("I", 0, lock=False)
-        self._data_len_b = multiprocessing.Value("I", 0, lock=False)
+        self._active_idx = mp_ctx.Value("I", 0, lock=True)
+        self._version_a = mp_ctx.Value("Q", 0, lock=True)
+        self._version_b = mp_ctx.Value("Q", 0, lock=True)
+
+        self._data_len_a = mp_ctx.Value("I", 0, lock=True)
+        self._data_len_b = mp_ctx.Value("I", 0, lock=True)
 
     @property
     def name(self) -> str:
@@ -144,6 +147,44 @@ class WeightSync:
         deserialize_to_model(model_layer, data, device)
         return True
 
+    def read_latest_if_new(
+        self,
+        model_layer: torch.nn.Module,
+        last_version: int,
+        device: Optional[torch.device] = None,
+    ) -> int:
+        """Read only if a newer version is available. Returns the new version.
+
+        Args:
+            model_layer: Module to load weights into.
+            last_version: Previously seen version (reader keeps this).
+            device: Target device.
+
+        Returns:
+            New version if weights were updated, or last_version if unchanged.
+        """
+        active = self._active_idx.value
+
+        if active == 0:
+            active_version = self._version_a.value
+            buf = self._buffer_a
+            data_len = self._data_len_a.value
+        else:
+            active_version = self._version_b.value
+            buf = self._buffer_b
+            data_len = self._data_len_b.value
+
+        if active_version <= last_version:
+            return last_version
+
+        nbytes = min(data_len, len(buf))
+        if nbytes == 0:
+            return last_version
+
+        data = bytes(buf[:nbytes])
+        deserialize_to_model(model_layer, data, device)
+        return active_version
+
     def read_latest_bytes(self) -> Optional[bytes]:
         """Read latest weight bytes. Returns None if no data yet."""
         active = self._active_idx.value
@@ -160,3 +201,35 @@ class WeightSync:
             return None
 
         return bytes(buf[:nbytes])
+
+    def read_latest_bytes_if_new(
+        self, last_version: int
+    ) -> tuple[int, Optional[bytes]]:
+        """Read latest bytes only if version changed.
+
+        Args:
+            last_version: Previously seen version.
+
+        Returns:
+            Tuple of (new_version, bytes_or_None).
+            If no update, returns (last_version, None).
+        """
+        active = self._active_idx.value
+
+        if active == 0:
+            active_version = self._version_a.value
+            buf = self._buffer_a
+            data_len = self._data_len_a.value
+        else:
+            active_version = self._version_b.value
+            buf = self._buffer_b
+            data_len = self._data_len_b.value
+
+        if active_version <= last_version:
+            return last_version, None
+
+        nbytes = min(data_len, len(buf))
+        if nbytes == 0:
+            return last_version, None
+
+        return active_version, bytes(buf[:nbytes])

@@ -22,9 +22,11 @@ from typing import List, Optional
 import torch
 
 from precog.messaging import (
+    ShmRingBuffer,
     ShmTensorSlot,
     WeightSync,
 )
+from precog.messaging.weight_sync import deserialize_to_model  # noqa: F401
 from precog.model import (
     ClockConfig,
     HierarchicalClock,
@@ -44,13 +46,14 @@ def _snapshot_from_step(
     sigreg_mean: torch.Tensor,
     sigreg_outer: torch.Tensor,
     prev_action: Optional[torch.Tensor],
-    weight_version: int,
 ) -> PerLevelSnapshot:
     return PerLevelSnapshot(
         level_idx=level_idx,
         z_below=z_below.detach().cpu(),
         h_init=h_init.detach().cpu(),
-        pred_from_above=pred_from_above.detach().cpu() if pred_from_above is not None else None,
+        pred_from_above=pred_from_above.detach().cpu()
+        if pred_from_above is not None
+        else None,
         task_target=task_target.detach().cpu() if task_target is not None else None,
         x_actual=x_actual.detach().cpu() if x_actual is not None else None,
         prev_action=prev_action.detach().cpu() if prev_action is not None else None,
@@ -68,7 +71,7 @@ def run_level_n(
     d_above: Optional[int],
     *,
     frequency: float,
-    experience_queue: multiprocessing.Queue,
+    experience_ring: ShmRingBuffer,
     weight_sync: WeightSync,
     upward_reader: Optional[ShmTensorSlot] = None,
     upward_writer: Optional[ShmTensorSlot] = None,
@@ -88,7 +91,7 @@ def run_level_n(
         d_below: Dimension of the level below's representation.
         d_above: Dimension of the level above's representation (None if top).
         frequency: Tick rate in Hz for this level.
-        experience_queue: Queue for sending experience to the Learner.
+        experience_ring: Ring buffer for sending experience to the Learner.
         weight_sync: WeightSync for receiving updated parameters.
         upward_reader: Reads z_below from the level below.
         upward_writer: Writes z_t upward to the level above.
@@ -122,9 +125,14 @@ def run_level_n(
 
     weight_version = 0
 
-    print(f"[L{level_idx}] Started on {device}, "
-          f"d_below={d_below}, d_repr={config.d_representation}, "
-          f"d_above={d_above}, freq={frequency}Hz")
+    print(
+        f"[L{level_idx}] Started on {device}, "
+        f"d_below={d_below}, d_repr={config.d_representation}, "
+        f"d_above={d_above}, freq={frequency}Hz"
+    )
+
+    _last_print = 0.0
+    _tick_count = 0
 
     while not stop_event.is_set():
         z_below: Optional[torch.Tensor] = None
@@ -142,6 +150,17 @@ def run_level_n(
         if z_below is None:
             time.sleep(0.0001)
             continue
+
+        _tick_count += 1
+
+        new_ver, ws_data = weight_sync.read_latest_bytes_if_new(weight_version)
+        if ws_data is not None:
+            deserialize_to_model(level, ws_data, dev)
+            weight_version = new_ver
+            now = time.monotonic()
+            if now - _last_print > 5.0:
+                print(f"[L{level_idx}] weights updated (v{new_ver})")
+                _last_print = now
 
         if accumulate_for_forward:
             accumulated.append(z_below)
@@ -167,9 +186,7 @@ def run_level_n(
         task_target = None
         x_actual = None
         if config.objective_enabled and obj_key:
-            task_target = torch.full(
-                (batch_size, 1), obj_target, device=dev
-            )
+            task_target = torch.full((batch_size, 1), obj_target, device=dev)
 
         h_in = h_state.detach()
 
@@ -200,27 +217,16 @@ def run_level_n(
             level_idx=level_idx,
             z_below=seq[:, 0],
             h_init=h_in,
-            pred_from_above=(
-                pfa_seq[:, 0]
-                if pfa_seq is not None
-                else None
-            ),
+            pred_from_above=(pfa_seq[:, 0] if pfa_seq is not None else None),
             task_target=task_target,
             x_actual=x_actual,
             sigreg_mean=sigreg_mean,
             sigreg_outer=sigreg_outer,
             prev_action=None,
-            weight_version=weight_version,
         )
-        experience_queue.put(snap)
+        experience_ring.write(snap)
 
         h_state = h_new.detach()
-
-        ws_data = weight_sync.read_latest_bytes()
-        if ws_data is not None:
-            from precog.messaging.weight_sync import deserialize_to_model
-            deserialize_to_model(level, ws_data, dev)
-            weight_version += 1
 
         accumulated = []
         pfa_accumulated = []

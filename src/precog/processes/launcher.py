@@ -30,9 +30,10 @@ import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import torch
 import yaml
 
-from precog.messaging import ShmTensorSlot, WeightSync
+from precog.messaging import ShmRingBuffer, ShmTensorSlot, WeightSync
 from precog.model import DEFAULT_CONFIG
 from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
 
@@ -40,17 +41,24 @@ ENV_CONFIG_PATH = "./src/precog/envs/ros/env_config.yaml"
 
 
 def _worker_l0(
-    stop_event, experience_queues, weight_syncs,
-    headless, dashboard_port, level_frequencies,
-    upward_writer_proxy, downward_reader_proxy,
-    rt_priority, rt_core,
+    stop_event,
+    experience_rings,
+    weight_syncs,
+    headless,
+    dashboard_port,
+    level_frequencies,
+    upward_writer_proxy,
+    downward_reader_proxy,
+    rt_priority,
+    rt_core,
 ):
     """Wrapper that catches exceptions in the L0 worker."""
     from precog.processes.level0 import run_level0
+
     try:
         run_level0(
             stop_event,
-            experience_queues,
+            experience_rings,
             weight_syncs,
             headless=headless,
             dashboard_port=dashboard_port,
@@ -63,18 +71,30 @@ def _worker_l0(
     except Exception as e:
         print(f"[Launcher] L0 process crashed: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
 
 
-def _worker_learner(stop_event, experience_queues, weight_syncs, device, learning_rate,
-                    ctrl_weight, staleness_max, sync_interval):
+def _worker_learner(
+    stop_event,
+    experience_rings,
+    weight_syncs,
+    config,
+    device,
+    learning_rate,
+    ctrl_weight,
+    staleness_max,
+    sync_interval,
+):
     """Wrapper that catches exceptions in the Learner worker."""
     from precog.processes.learner import run_learner
+
     try:
         run_learner(
             stop_event,
-            experience_queues,
+            experience_rings,
             weight_syncs,
+            config=config,
             device=device,
             learning_rate=learning_rate,
             ctrl_weight=ctrl_weight,
@@ -84,19 +104,31 @@ def _worker_learner(stop_event, experience_queues, weight_syncs, device, learnin
     except Exception as e:
         print(f"[Launcher] Learner process crashed: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
 
 
 def _worker_level_n(
-    stop_event, level_idx, config_dict, d_below, d_above, frequency,
-    experience_queue, weight_sync, upward_reader, upward_writer,
-    downward_reader, downward_writer, device,
+    stop_event,
+    level_idx,
+    config_dict,
+    d_below,
+    d_above,
+    frequency,
+    experience_ring,
+    weight_sync,
+    upward_reader,
+    upward_writer,
+    downward_reader,
+    downward_writer,
+    device,
 ):
     """Wrapper that catches exceptions in an upper-level worker."""
     from precog.processes.level_n import run_level_n
-    from precog.model.config import PCLevelConfig
+    from precog.model.config import PCLevelConfig, SSMConfig
 
-    cfg = PCLevelConfig(**config_dict)
+    ssm_dict = config_dict.pop("ssm", {})
+    cfg = PCLevelConfig(ssm=SSMConfig(**ssm_dict), **config_dict)
 
     kwargs: Dict[str, Any] = {
         "stop_event": stop_event,
@@ -105,7 +137,7 @@ def _worker_level_n(
         "d_below": d_below,
         "d_above": d_above,
         "frequency": frequency,
-        "experience_queue": experience_queue,
+        "experience_ring": experience_ring,
         "weight_sync": weight_sync,
         "device": device,
         "obj_key": cfg.objective_observable_key,
@@ -113,24 +145,26 @@ def _worker_level_n(
     }
 
     if upward_reader is not None:
-        kwargs["upward_reader"] = _ShmReaderHandle(*upward_reader)
+        kwargs["upward_reader"] = _ShmReaderHandle(*upward_reader).reader()
     if upward_writer is not None:
-        kwargs["upward_writer"] = _ShmWriterHandle(*upward_writer)
+        kwargs["upward_writer"] = _ShmWriterHandle(*upward_writer).writer()
     if downward_reader is not None:
-        kwargs["downward_reader"] = _ShmReaderHandle(*downward_reader)
+        kwargs["downward_reader"] = _ShmReaderHandle(*downward_reader).reader()
     if downward_writer is not None:
-        kwargs["downward_writer"] = _ShmWriterHandle(*downward_writer)
+        kwargs["downward_writer"] = _ShmWriterHandle(*downward_writer).writer()
 
     try:
         run_level_n(**kwargs)
     except Exception as e:
         print(f"[Launcher] Level {level_idx} process crashed: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
 
 
 class _ShmReaderHandle:
     """Serializable handle for attaching to a ShmTensorSlot reader in a child process."""
+
     def __init__(self, name: str, shape: tuple, dtype_str: str):
         self.name = name
         self.shape = shape
@@ -142,6 +176,7 @@ class _ShmReaderHandle:
 
 class _ShmWriterHandle:
     """Serializable handle for attaching to a ShmTensorSlot writer in a child process."""
+
     def __init__(self, name: str, shape: tuple, dtype_str: str):
         self.name = name
         self.shape = shape
@@ -159,19 +194,21 @@ class Launcher:
         num_levels: int = 2,
         ctrl_level_idx: int = 0,
         *,
-        device: str = "cpu",
+        device: Optional[str] = None,
         headless: bool = True,
         dashboard_port: int = 8080,
         level_frequencies: Optional[List[float]] = None,
         learning_rate: float = 1e-3,
         ctrl_weight: float = 1.0,
-        staleness_max: int = 500,
-        sync_interval: float = 0.1,
+        staleness_max: int = 5000,
+        sync_interval: float = 1.0,
         rt_priority: int = 0,
         rt_core: Optional[int] = None,
     ):
         self._num_levels = num_levels
         self._ctrl_level_idx = ctrl_level_idx
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = device
         self._headless = headless
         self._dashboard_port = dashboard_port
@@ -189,7 +226,7 @@ class Launcher:
         self._upper_processes: List[multiprocessing.Process] = []
         self._upper_level_kwargs: List[Dict[str, Any]] = []
 
-        self._experience_queues: List[multiprocessing.Queue] = []
+        self._experience_rings: List[ShmRingBuffer] = []
         self._weight_syncs: List[WeightSync] = []
 
         self._upward_slots: List[ShmTensorSlot] = []
@@ -207,7 +244,7 @@ class Launcher:
         if self._level_frequencies:
             return self._level_frequencies
         base = max(200.0, 200.0)
-        return [base / (2 ** i) for i in range(self._num_levels)]
+        return [base / (2**i) for i in range(self._num_levels)]
 
     def start(self) -> None:
         """Spawn all processes and begin supervision."""
@@ -228,24 +265,25 @@ class Launcher:
         config = self._config
 
         for i in range(self._num_levels):
-            self._experience_queues.append(ctx.Queue(maxsize=1024))
-            self._weight_syncs.append(WeightSync(f"sync_L{i}", i))
+            self._experience_rings.append(ShmRingBuffer(f"exp_L{i}"))
+            self._weight_syncs.append(WeightSync(f"sync_L{i}", i, mp_ctx=ctx))
 
         for i in range(self._num_levels - 1):
             lvl_cfg = config.level_configs[i]
             d_repr = lvl_cfg.d_representation
 
-            slot_up = ShmTensorSlot(f"up_L{i}_to_L{i+1}", (1, d_repr))
+            slot_up = ShmTensorSlot(f"up_L{i}_to_L{i + 1}", (1, d_repr))
             self._upward_slots.append(slot_up)
 
-            slot_down = ShmTensorSlot(f"down_L{i+1}_to_L{i}", (1, d_repr))
+            slot_down = ShmTensorSlot(f"down_L{i + 1}_to_L{i}", (1, d_repr))
             self._downward_slots.append(slot_down)
 
     def _spawn_learner(self, ctx) -> None:
         learner_kwargs = {
             "stop_event": self._stop_event,
-            "experience_queues": self._experience_queues,
+            "experience_rings": self._experience_rings,
             "weight_syncs": self._weight_syncs,
+            "config": self._config,
             "device": self._device,
             "learning_rate": self._learning_rate,
             "ctrl_weight": self._ctrl_weight,
@@ -342,7 +380,7 @@ class Launcher:
                 "d_below": d_below,
                 "d_above": d_above,
                 "frequency": freqs[i],
-                "experience_queue": self._experience_queues[i],
+                "experience_ring": self._experience_rings[i],
                 "weight_sync": self._weight_syncs[i],
                 "upward_reader": upward_reader,
                 "upward_writer": upward_writer,
@@ -385,7 +423,7 @@ class Launcher:
 
         l0_kwargs = {
             "stop_event": self._stop_event,
-            "experience_queues": self._experience_queues,
+            "experience_rings": self._experience_rings,
             "weight_syncs": self._weight_syncs,
             "headless": self._headless,
             "dashboard_port": self._dashboard_port,
@@ -421,8 +459,10 @@ class Launcher:
                     self.shutdown()
                     break
 
-                if (self._learner_process is not None
-                        and not self._learner_process.is_alive()):
+                if (
+                    self._learner_process is not None
+                    and not self._learner_process.is_alive()
+                ):
                     print("[Launcher] Learner process crashed!")
                     if not self._stop_event.is_set():
                         print("[Launcher] Restarting Learner...")
@@ -430,9 +470,9 @@ class Launcher:
 
                 for i, proc in enumerate(self._upper_processes):
                     if proc is not None and not proc.is_alive():
-                        print(f"[Launcher] L{i+1} process crashed!")
+                        print(f"[Launcher] L{i + 1} process crashed!")
                         if not self._stop_event.is_set():
-                            print(f"[Launcher] Restarting L{i+1}...")
+                            print(f"[Launcher] Restarting L{i + 1}...")
                             self._restart_upper_level(i)
 
                 time.sleep(0.5)
@@ -446,8 +486,9 @@ class Launcher:
 
         learner_kwargs = {
             "stop_event": self._stop_event,
-            "experience_queues": self._experience_queues,
+            "experience_rings": self._experience_rings,
             "weight_syncs": self._weight_syncs,
+            "config": self._config,
             "device": self._device,
             "learning_rate": self._learning_rate,
             "ctrl_weight": self._ctrl_weight,
@@ -497,8 +538,8 @@ class Launcher:
                     proc.terminate()
                     proc.join(timeout=2.0)
 
-        for q in self._experience_queues:
-            q.close()
+        for rb in self._experience_rings:
+            rb.close()
 
         for slot in self._upward_slots:
             slot.close()

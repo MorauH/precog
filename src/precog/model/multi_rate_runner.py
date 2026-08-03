@@ -143,7 +143,7 @@ class MultiRateRunner:
         obs_dict: Dict[str, torch.Tensor],
         prev_action: Optional[torch.Tensor] = None,
     ) -> ForwardOutput:
-        """Forward-only pass. Never calls backward()."""
+        """Full multi-level forward pass. Never calls backward()."""
         if prev_action is not None:
             prev_action = prev_action.detach()
 
@@ -158,7 +158,11 @@ class MultiRateRunner:
         z_level0 = self._encode_level0(obs_dict, prev_action)
         if torch.isnan(z_level0).any():
             return ForwardOutput(
-                action=torch.zeros(self.cfg.batch_size, self.model.config.control_dim, device=self.device),
+                action=torch.zeros(
+                    self.cfg.batch_size,
+                    self.model.config.control_dim,
+                    device=self.device,
+                ),
                 level_snapshots=[],
                 updated_levels=[],
                 level_states=list(self._level_states),
@@ -217,7 +221,9 @@ class MultiRateRunner:
             is_single = seq.shape[1] == 1
 
             if is_single:
-                pfa_single = pred_from_above[:, 0] if pred_from_above is not None else None
+                pfa_single = (
+                    pred_from_above[:, 0] if pred_from_above is not None else None
+                )
                 z_t, _, h_new, eps_t, x_star = level.step(
                     seq[:, 0], h_in, pfa_single, task_target
                 )
@@ -244,9 +250,7 @@ class MultiRateRunner:
                 )
             else:
                 pfa_for_replay = (
-                    pred_from_above.detach()
-                    if pred_from_above is not None
-                    else None
+                    pred_from_above.detach() if pred_from_above is not None else None
                 )
 
             z_below_for_replay = seq[:, 0].detach() if is_single else seq.detach()
@@ -298,6 +302,112 @@ class MultiRateRunner:
             tick_count=current_tick,
         )
 
+    def forward_level0(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        prev_action: Optional[torch.Tensor] = None,
+        pred_from_above: Optional[torch.Tensor] = None,
+    ) -> ForwardOutput:
+        """Lightweight forward pass for L0 process — level 0 only.
+
+        Runs encoding, Level 0 SSM step, and control head. Does NOT
+        iterate upper levels (those run in separate level_n processes).
+
+        Args:
+            obs_dict: Raw observation dict.
+            prev_action: Previous action for imitation loss replay.
+            pred_from_above: Top-down prediction from L1 (read from
+                downward ShmTensorSlot). If None, no top-down signal.
+
+        Returns:
+            ForwardOutput with only level 0's snapshot and states.
+        """
+        if prev_action is not None:
+            prev_action = prev_action.detach()
+
+        self.clock.tick()
+        current_tick = self.clock._tick_count
+        sim_time = self.clock.sim_time()
+
+        z_level0 = self._encode_level0(obs_dict, prev_action)
+        if torch.isnan(z_level0).any():
+            return ForwardOutput(
+                action=torch.zeros(
+                    self.cfg.batch_size,
+                    self.model.config.control_dim,
+                    device=self.device,
+                ),
+                level_snapshots=[],
+                updated_levels=[],
+                level_states=list(self._level_states),
+                sim_time=sim_time,
+                total_surprise=None,
+                tick_count=current_tick,
+            )
+
+        level = self.model.levels[0]
+        state = self._level_states[0]
+        lvl_cfg = self.model.config.level_configs[0]
+        h_in = state.hidden.detach()
+
+        task_target = None
+        x_actual = None
+        if lvl_cfg.objective_enabled:
+            task_target = torch.full(
+                (1, 1),
+                lvl_cfg.objective_target_value,
+                device=self.device,
+            )
+            raw = obs_dict.get(lvl_cfg.objective_observable_key)
+            if raw is not None:
+                x_actual = raw.reshape(1, -1)[:, :1]
+
+        pfa_single = (
+            pred_from_above.detach().to(self.device)
+            if pred_from_above is not None
+            else None
+        )
+        z_t, _, h_new, eps_t, x_star = level.step(
+            z_level0, h_in, pfa_single, task_target
+        )
+
+        surprise_i = eps_t.pow(2).mean()
+        sigreg_mean = level.sigreg._mean.detach().clone()
+        sigreg_outer = level.sigreg._outer.detach().clone()
+
+        snapshot = PerLevelSnapshot(
+            level_idx=0,
+            z_below=z_level0.detach(),
+            h_init=h_in.detach(),
+            pred_from_above=pfa_single.detach() if pfa_single is not None else None,
+            task_target=task_target.detach() if task_target is not None else None,
+            x_actual=x_actual.detach() if x_actual is not None else None,
+            prev_action=prev_action.detach() if prev_action is not None else None,
+            sigreg_mean=sigreg_mean,
+            sigreg_outer=sigreg_outer,
+            is_single_step=True,
+        )
+
+        state.update(
+            hidden=h_new.detach(),
+            z=z_t.detach(),
+            pred_error=eps_t.detach(),
+            tick=current_tick,
+            sim_time=sim_time,
+        )
+
+        action = self.model.control_head(z_t.unsqueeze(1))[:, -1]
+
+        return ForwardOutput(
+            action=action,
+            level_snapshots=[snapshot],
+            updated_levels=[0],
+            level_states=list(self._level_states),
+            sim_time=sim_time,
+            total_surprise=surprise_i,
+            tick_count=current_tick,
+        )
+
     def learn_step(self, forward_outputs: List[ForwardOutput]) -> None:
         """Replay forward passes and run backward + step for all levels.
 
@@ -334,8 +444,16 @@ class MultiRateRunner:
                 if snap.is_single_step:
                     z_below = snap.z_below.to(self.device).unsqueeze(0)
                     h_in = snap.h_init.to(self.device)
-                    pfa: Optional[torch.Tensor] = snap.pred_from_above.to(self.device) if snap.pred_from_above is not None else None
-                    tt: Optional[torch.Tensor] = snap.task_target.to(self.device) if snap.task_target is not None else None
+                    pfa: Optional[torch.Tensor] = (
+                        snap.pred_from_above.to(self.device)
+                        if snap.pred_from_above is not None
+                        else None
+                    )
+                    tt: Optional[torch.Tensor] = (
+                        snap.task_target.to(self.device)
+                        if snap.task_target is not None
+                        else None
+                    )
 
                     z_t, _, _, eps_t, x_star = level.step(z_below[0], h_in, pfa, tt)
                     epsilon = eps_t.unsqueeze(0)
@@ -343,8 +461,16 @@ class MultiRateRunner:
                 else:
                     z_below = snap.z_below.to(self.device)
                     h_in = snap.h_init.to(self.device)
-                    pfa_seq: Optional[torch.Tensor] = snap.pred_from_above.to(self.device) if snap.pred_from_above is not None else None
-                    tt: Optional[torch.Tensor] = snap.task_target.to(self.device) if snap.task_target is not None else None
+                    pfa_seq: Optional[torch.Tensor] = (
+                        snap.pred_from_above.to(self.device)
+                        if snap.pred_from_above is not None
+                        else None
+                    )
+                    tt: Optional[torch.Tensor] = (
+                        snap.task_target.to(self.device)
+                        if snap.task_target is not None
+                        else None
+                    )
 
                     z_seq, _, _, epsilon, _, x_star_seq = level.forward(
                         z_below, h_in, pfa_seq, tt
@@ -357,12 +483,24 @@ class MultiRateRunner:
                 loss_terms.append(loss)
 
                 if x_star is not None:
-                    xa = snap.x_actual.to(self.device) if snap.x_actual is not None else None
-                    tgt = snap.task_target.to(self.device) if snap.task_target is not None else None
+                    xa = (
+                        snap.x_actual.to(self.device)
+                        if snap.x_actual is not None
+                        else None
+                    )
+                    tgt = (
+                        snap.task_target.to(self.device)
+                        if snap.task_target is not None
+                        else None
+                    )
                     if xa is not None and tgt is not None:
                         loss_ae = F.mse_loss(x_star, xa)
                         loss_task = F.mse_loss(x_star, tgt)
-                        loss = loss + level.ae_weight * loss_ae + level.task_weight * loss_task
+                        loss = (
+                            loss
+                            + level.ae_weight * loss_ae
+                            + level.task_weight * loss_task
+                        )
                         loss_terms[-1] = loss
 
                 if level_idx == ctrl_idx and snap.prev_action is not None:
@@ -477,11 +615,15 @@ def replay_learn_level(
     device: torch.device,
     ctrl_weight: float = 1.0,
     is_control_level: bool = False,
+    micro_batch: int = 0,
 ) -> Optional[float]:
     """Replay forward passes from snapshots and run backward + step.
 
-    Used by the decoupled Learner process, which replays experience on
-    its own model copies without sharing an autograd graph.
+    Uses per-snapshot backward+step to keep autograd graphs small —
+    critical for CPU performance. A single backward through N stacked
+    graphs on CPU scales poorly (the autograd engine holds N×
+    intermediate tensors). Processing each snapshot independently
+    keeps each graph tiny.
 
     Args:
         level: The PC level to train (learner's copy).
@@ -491,9 +633,12 @@ def replay_learn_level(
         device: Torch device for computation.
         ctrl_weight: Imitation loss weight.
         is_control_level: Whether this level drives the control head.
+        micro_batch: Accumulate gradients over this many snapshots before
+            stepping (0 = step per snapshot). Helps when batch size is
+            small and gradient noise is high.
 
     Returns:
-        Total loss scalar, or None if no valid snapshots.
+        Average loss across all snapshots, or None if no valid snapshots.
     """
     if not snapshots:
         return None
@@ -505,24 +650,42 @@ def replay_learn_level(
         level.sigreg._mean.copy_(snapshots[-1].sigreg_mean)
         level.sigreg._outer.copy_(snapshots[-1].sigreg_outer)
 
-    loss_terms: List[torch.Tensor] = []
+    total_loss = 0.0
+    count = 0
+    micro_count = 0
+
+    def _apply_gradients():
+        nonlocal micro_count
+        if micro_count == 0:
+            return
+        grad_nan = any(
+            p.grad is not None and torch.isnan(p.grad).any()
+            for group in optimizer.param_groups
+            for p in group["params"]
+        )
+        if grad_nan:
+            optimizer.zero_grad()
+        else:
+            optimizer.step()
+            optimizer.zero_grad()
+        micro_count = 0
 
     for snap in snapshots:
         if snap.is_single_step:
-            z_below = snap.z_below.to(device).unsqueeze(0)
-            h_in = snap.h_init.to(device)
+            z_below = snap.z_below.to(device, non_blocking=True)
+            h_in = snap.h_init.to(device, non_blocking=True)
             pfa: Optional[torch.Tensor] = (
-                snap.pred_from_above.to(device)
+                snap.pred_from_above.to(device, non_blocking=True)
                 if snap.pred_from_above is not None
                 else None
             )
             tt: Optional[torch.Tensor] = (
-                snap.task_target.to(device)
+                snap.task_target.to(device, non_blocking=True)
                 if snap.task_target is not None
                 else None
             )
 
-            z_t, _, _, eps_t, x_star = level.step(z_below[0], h_in, pfa, tt)
+            z_t, _, _, eps_t, x_star = level.step(z_below, h_in, pfa, tt)
             epsilon = eps_t.unsqueeze(0)
             z_seq = z_t.unsqueeze(0)
         else:
@@ -534,9 +697,7 @@ def replay_learn_level(
                 else None
             )
             tt: Optional[torch.Tensor] = (
-                snap.task_target.to(device)
-                if snap.task_target is not None
-                else None
+                snap.task_target.to(device) if snap.task_target is not None else None
             )
 
             z_seq, _, _, epsilon, _, x_star_seq = level.forward(
@@ -547,16 +708,15 @@ def replay_learn_level(
         surprise_i = epsilon.pow(2).mean()
         sigreg_loss = level.sigreg.compute_loss_online()
         loss = surprise_i + sigreg_loss
-        loss_terms.append(loss)
 
         if x_star is not None:
             xa = (
-                snap.x_actual.to(device)
+                snap.x_actual.to(device, non_blocking=True)
                 if snap.x_actual is not None
                 else None
             )
             tgt = (
-                snap.task_target.to(device)
+                snap.task_target.to(device, non_blocking=True)
                 if snap.task_target is not None
                 else None
             )
@@ -564,34 +724,34 @@ def replay_learn_level(
                 loss_ae = F.mse_loss(x_star, xa)
                 loss_task = F.mse_loss(x_star, tgt)
                 loss = loss + level.ae_weight * loss_ae + level.task_weight * loss_task
-                loss_terms[-1] = loss
 
-        if is_control_level and snap.prev_action is not None and control_head is not None:
-            prev_act = snap.prev_action.to(device)
+        if (
+            is_control_level
+            and snap.prev_action is not None
+            and control_head is not None
+        ):
+            prev_act = snap.prev_action.to(device, non_blocking=True)
             z_ctrl = z_seq[:, -1].unsqueeze(1)
             action_pred_ctrl = control_head(z_ctrl)[:, -1]
             ctrl_loss = F.mse_loss(action_pred_ctrl, prev_act)
             loss = loss + ctrl_weight * ctrl_loss
-            loss_terms[-1] = loss
 
-    total_loss = torch.stack(loss_terms).sum()
+        if torch.isnan(loss) or torch.isinf(loss):
+            optimizer.zero_grad()
+            micro_count = 0
+            continue
 
-    if torch.isnan(total_loss) or torch.isinf(total_loss):
-        optimizer.zero_grad()
-    else:
-        total_loss.backward()
-        grad_nan = any(
-            p.grad is not None and torch.isnan(p.grad).any()
-            for group in optimizer.param_groups
-            for p in group["params"]
-        )
-        if grad_nan:
-            optimizer.zero_grad()
-        else:
-            optimizer.step()
-            optimizer.zero_grad()
+        loss.backward()
+        micro_count += 1
+        total_loss += loss.detach().item()
+        count += 1
+
+        if micro_batch <= 0 or micro_count >= micro_batch:
+            _apply_gradients()
+
+    _apply_gradients()
 
     level.sigreg._mean.copy_(sigreg_mean_saved)
     level.sigreg._outer.copy_(sigreg_outer_saved)
 
-    return total_loss.item()
+    return total_loss / max(count, 1)

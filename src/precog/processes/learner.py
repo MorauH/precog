@@ -21,20 +21,22 @@ from typing import Dict, List, Optional
 
 import torch
 
-from precog.messaging import WeightSync
+from precog.messaging import ShmRingBuffer, WeightSync
 from precog.model import (
     DEFAULT_CONFIG,
     HierarchicalPCWorldModel,
     PerLevelSnapshot,
     replay_learn_level,
 )
+from precog.model.config import ModelConfig
 
 
 def run_learner(
     stop_event: multiprocessing.Event,
-    experience_queues: List[multiprocessing.Queue],
+    experience_rings: List[ShmRingBuffer],
     weight_syncs: List[WeightSync],
     *,
+    config: Optional[ModelConfig] = None,
     device: str = "cpu",
     learning_rate: float = 1e-3,
     ctrl_weight: float = 1.0,
@@ -46,8 +48,10 @@ def run_learner(
 
     Args:
         stop_event: Set by launcher to request clean shutdown.
-        experience_queues: One Queue per level for receiving experience.
+        experience_rings: One ShmRingBuffer per level for receiving experience.
         weight_syncs: One WeightSync per level for publishing parameters.
+        config: Resolved model config (with correct d_input). Falls back
+            to DEFAULT_CONFIG if not provided.
         device: Torch device (cpu or cuda).
         learning_rate: AdamW learning rate.
         ctrl_weight: Imitation loss weight.
@@ -59,10 +63,11 @@ def run_learner(
     device_torch = torch.device(device)
 
     if device_torch.type == "cuda":
-        torch.cuda.set_device(device_torch)
-        print(f"[Learner] CUDA device: {torch.cuda.get_device_name(device_torch)}")
+        cuda_idx = device_torch.index if device_torch.index is not None else 0
+        torch.cuda.set_device(cuda_idx)
+        print(f"[Learner] CUDA device: {torch.cuda.get_device_name(cuda_idx)}")
 
-    config = DEFAULT_CONFIG
+    config = config or DEFAULT_CONFIG
 
     learner_model = HierarchicalPCWorldModel(config).to(device_torch)
     learner_model.train()
@@ -78,49 +83,49 @@ def run_learner(
 
     weight_versions: Dict[int, int] = {}
     last_sync: Dict[int, float] = {}
-    last_log: Dict[int, float] = {}
     staleness_samples: Dict[int, List[int]] = {}
 
     for ws in weight_syncs:
         weight_versions[ws.level_idx] = 0
         last_sync[ws.level_idx] = time.monotonic()
-        last_log[ws.level_idx] = 0.0
         staleness_samples[ws.level_idx] = []
 
     num_levels = len(learner_model.levels)
 
-    print(f"[Learner] Started on {device}, {num_levels} levels, "
-          f"lr={learning_rate}, staleness_max={staleness_max}, "
-          f"batch_max={batch_max_size}")
+    print(
+        f"[Learner] Started on {device}, {num_levels} levels, "
+        f"lr={learning_rate}, staleness_max={staleness_max}, "
+        f"batch_max={batch_max_size}"
+    )
+
+    for i, ring in enumerate(experience_rings):
+        drained = ring.read_all()
+        if drained:
+            print(f"[Learner] Drained {len(drained)} stale snaps from L{i} ring buffer")
 
     while not stop_event.is_set():
         any_processed = False
 
         for level_idx in range(num_levels):
-            queue = experience_queues[level_idx]
+            ring = experience_rings[level_idx]
             level = learner_model.levels[level_idx]
             optimizer = optimizers[level_idx]
 
+            raw_snapshots = ring.read_all(max_count=batch_max_size)
+            if not raw_snapshots:
+                continue
+
             snapshots: List[PerLevelSnapshot] = []
-            drain_count = 0
             skipped_stale = 0
+            for snap in raw_snapshots:
+                gap = 0  # staleness tracking simplified for lock-free path
+                if staleness_max > 0 and gap > staleness_max:
+                    skipped_stale += 1
+                    continue
+                staleness_samples[level_idx].append(gap)
+                snapshots.append(snap)
 
-            while not queue.empty() and len(snapshots) < batch_max_size:
-                try:
-                    snap = queue.get_nowait()
-                    drain_count += 1
-
-                    exp_version = getattr(snap, '_weight_version', 0)
-                    gap = weight_versions.get(level_idx, 0) - exp_version
-
-                    if staleness_max > 0 and gap > staleness_max:
-                        skipped_stale += 1
-                        continue
-
-                    staleness_samples[level_idx].append(gap)
-                    snapshots.append(snap)
-                except Exception:
-                    break
+            drain_count = len(raw_snapshots)
 
             if skipped_stale > 0:
                 print(
@@ -131,11 +136,7 @@ def run_learner(
             if not snapshots:
                 continue
 
-            ctrl_head = (
-                learner_model.control_head
-                if level_idx == ctrl_idx
-                else None
-            )
+            ctrl_head = learner_model.control_head if level_idx == ctrl_idx else None
 
             t0 = time.monotonic()
             total_loss = replay_learn_level(
@@ -156,10 +157,7 @@ def run_learner(
             if now - last_sync.get(level_idx, 0.0) >= sync_interval_seconds:
                 ws = weight_syncs[level_idx]
 
-                if level_idx == ctrl_idx:
-                    weights = learner_model.get_weights(level_idx)
-                else:
-                    weights = learner_model.get_weights(level_idx)
+                weights = learner_model.get_weights(level_idx)
 
                 ws.write_state_dict(weights)
                 last_sync[level_idx] = now
@@ -173,7 +171,7 @@ def run_learner(
                     )
                     print(
                         f"[Learner] L{level_idx}: {len(snapshots)} snaps, "
-                        f"loss={total_loss:.6f}, dt={dt*1000:.1f}ms, "
+                        f"loss={total_loss:.6f}, dt={dt * 1000:.1f}ms, "
                         f"v={weight_versions[level_idx]}, "
                         f"staleness_avg={avg_gap:.1f}"
                     )

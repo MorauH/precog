@@ -27,8 +27,9 @@ uv sync --extra cuda    # CUDA 13.2 (mutually exclusive with cpu)
 
 ```bash
 python src/precog/test_read_env.py   # Read-only telemetry smoke test
-python -m precog.main                 # Full control loop
-precog                               # After install (entry point)
+python -m precog.main                 # Legacy synchronous control loop
+python -m precog.processes.cli        # Pipelined actor (decoupled learning)
+precog                               # After install (entry point → pipelined)
 ```
 
 ### Lint & Format

@@ -7,6 +7,9 @@ Writer-latest-wins pattern for inter-process handoffs:
     If counter changed or was odd (writer active), retry.
   - Reader uses short bounded spin-then-yield: ~50us spin, then os.sched_yield().
 
+The generation counter lives in the shared-memory buffer itself
+(last 4 bytes), so attacher and creator share it automatically.
+
 Used for:
   - Upward channels (z_L → L+1)
   - Downward channels (pred_from_above → L-1)
@@ -14,8 +17,8 @@ Used for:
 
 from __future__ import annotations
 
-import multiprocessing
 import os
+import struct
 import time
 from multiprocessing.shared_memory import SharedMemory
 from typing import Optional
@@ -28,16 +31,20 @@ _WRITER_RETRY_COUNT = 3
 _READER_SPIN_US = 50
 _READER_SPIN_ITERATIONS = 10
 _READER_RETRY_COUNT = 16
+_GEN_OFFSET = 0
+_GEN_BYTES = 4
+
 
 def _time_us() -> float:
     return time.perf_counter() * 1_000_000
 
 
-def _atomic_cas_increment(value: multiprocessing.Value) -> int:
-    """Busy-looping CAS increment on a multiprocessing.Value with lock=False."""
-    with value.get_lock():
-        value.value += 2
-        return value.value
+def _encode_u32(v: int) -> bytes:
+    return struct.pack("<I", v & 0xFFFFFFFF)
+
+
+def _decode_u32(b: memoryview) -> int:
+    return struct.unpack("<I", b.cast("B")[:4])[0]
 
 
 class ShmTensorSlot:
@@ -55,12 +62,13 @@ class ShmTensorSlot:
 
     def __init__(self, name: str, shape: tuple[int, ...], dtype: np.dtype = np.float32):
         self._shape = shape
-        self._dtype = dtype
-        self._nbytes = int(np.prod(shape)) * dtype.itemsize
+        self._dtype = np.dtype(dtype)
+        self._payload_bytes = int(np.prod(shape)) * self._dtype.itemsize
+        self._total_bytes = self._payload_bytes + _GEN_BYTES
 
         shm_name = f"shm_slot_{name}"
-        self._shm = SharedMemory(name=shm_name, create=True, size=self._nbytes)
-        self._gen = multiprocessing.Value("I", 0, lock=True)
+        self._shm = SharedMemory(name=shm_name, create=True, size=self._total_bytes)
+        self._gen_view = self._shm.buf[_GEN_OFFSET:_GEN_OFFSET + _GEN_BYTES]
 
         self._name = name
         self._shm_name = shm_name
@@ -69,12 +77,17 @@ class ShmTensorSlot:
     @classmethod
     def attach(cls, name: str, shape: tuple[int, ...], dtype: np.dtype = np.float32) -> "ShmTensorSlot":
         """Attach to an existing ShmTensorSlot from another process."""
+        d = np.dtype(dtype)
+        payload_bytes = int(np.prod(shape)) * d.itemsize
+        total_bytes = payload_bytes + _GEN_BYTES
+
         slot = cls.__new__(cls)
         slot._shape = shape
-        slot._dtype = dtype
-        slot._nbytes = int(np.prod(shape)) * dtype.itemsize
+        slot._dtype = d
+        slot._payload_bytes = payload_bytes
+        slot._total_bytes = total_bytes
         slot._shm = SharedMemory(name=f"shm_slot_{name}")
-        slot._gen = multiprocessing.Value("I", 0, lock=True)
+        slot._gen_view = slot._shm.buf[_GEN_OFFSET:_GEN_OFFSET + _GEN_BYTES]
         slot._name = name
         slot._shm_name = f"shm_slot_{name}"
         slot._closed = False
@@ -88,15 +101,25 @@ class ShmTensorSlot:
     def shape(self) -> tuple[int, ...]:
         return self._shape
 
+    def _bump_gen(self) -> None:
+        v = _decode_u32(self._gen_view) + 1
+        self._gen_view[:] = _encode_u32(v)
+
+    def _read_gen(self) -> int:
+        return _decode_u32(self._gen_view)
+
     def write(self, tensor: torch.Tensor) -> None:
         """Write a tensor to the slot. Blocks briefly during seqlock window."""
         tensor = tensor.detach().cpu().contiguous()
-        arr = np.ndarray(self._shape, dtype=self._dtype, buffer=self._shm.buf)
+        arr = np.ndarray(
+            self._shape, dtype=self._dtype,
+            buffer=self._shm.buf[_GEN_BYTES:_GEN_BYTES + self._payload_bytes]
+        )
 
         for _ in range(_WRITER_RETRY_COUNT):
-            gen = _atomic_cas_increment(self._gen)
+            self._bump_gen()
             np.copyto(arr, tensor.numpy().reshape(self._shape))
-            _atomic_cas_increment(self._gen)
+            self._bump_gen()
             return
 
     def read(self, timeout_us: float = 5000) -> Optional[torch.Tensor]:
@@ -106,9 +129,12 @@ class ShmTensorSlot:
             timeout_us: Maximum time in microseconds to wait for valid data.
 
         Returns:
-            Tensor view into shared memory, or None if timeout.
+            Tensor copy from shared memory, or None if timeout.
         """
-        arr = np.ndarray(self._shape, dtype=self._dtype, buffer=self._shm.buf)
+        arr = np.ndarray(
+            self._shape, dtype=self._dtype,
+            buffer=self._shm.buf[_GEN_BYTES:_GEN_BYTES + self._payload_bytes]
+        )
         deadline = _time_us() + timeout_us
 
         for _ in range(_READER_RETRY_COUNT):
@@ -116,13 +142,13 @@ class ShmTensorSlot:
                 if _time_us() >= deadline:
                     return None
 
-                gen_0 = self._gen.value
+                gen_0 = self._read_gen()
                 if gen_0 & 1:
                     time.sleep(0)
                     continue
 
                 result = arr.copy()
-                gen_1 = self._gen.value
+                gen_1 = self._read_gen()
 
                 if gen_0 == gen_1 and not (gen_0 & 1):
                     return torch.from_numpy(result).clone()
@@ -135,7 +161,8 @@ class ShmTensorSlot:
         if self._closed:
             return
         self._closed = True
-        self._shm.close()
-        self._shm.unlink()
-
-    pass
+        try:
+            self._shm.close()
+            self._shm.unlink()
+        except Exception:
+            pass

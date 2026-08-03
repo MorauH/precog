@@ -7,6 +7,8 @@ Replaces the old synchronous main.py with a multiprocessing launcher.
 import argparse
 import sys
 
+import torch
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -23,12 +25,13 @@ def main():
         default=8080,
         help="Dashboard port (default: 8080)",
     )
+    _def_device = "cuda" if torch.cuda.is_available() else "cpu"
     parser.add_argument(
         "--device",
         type=str,
-        default="cpu",
+        default=_def_device,
         choices=["cpu", "cuda"],
-        help="Device for learner and upper-level processes (default: cpu)",
+        help=f"Device for learner and upper-level processes (default: {_def_device})",
     )
     parser.add_argument(
         "--num-levels",
@@ -57,14 +60,14 @@ def main():
     parser.add_argument(
         "--staleness-max",
         type=int,
-        default=500,
-        help="Max tolerable staleness gap (default: 500)",
+        default=5000,
+        help="Max tolerable staleness gap (default: 5000)",
     )
     parser.add_argument(
         "--sync-interval",
         type=float,
-        default=0.1,
-        help="Weight sync interval in seconds (default: 0.1)",
+        default=1.0,
+        help="Weight sync interval in seconds (default: 1.0)",
     )
     parser.add_argument(
         "--level-frequencies",

@@ -41,6 +41,7 @@ class ClockConfig:
         Only affects `sleep_until_next_tick()` – the tick counter itself
         advances independently of wall-clock time when you call `tick()`.
     """
+
     level_frequencies: List[float]
     time_scale: float = 1.0
 
@@ -80,7 +81,12 @@ class HierarchicalClock:
 
     config: ClockConfig
     _tick_count: int = field(default=0, init=False, repr=False)
-    _wall_start: float = field(default_factory=time.perf_counter, init=False, repr=False)
+    _wall_start: float = field(
+        default_factory=time.perf_counter, init=False, repr=False
+    )
+    _next_tick_time: float = field(
+        default_factory=time.perf_counter, init=False, repr=False
+    )
     _sim_time: float = field(default=0.0, init=False, repr=False)
 
     # ------------------------------------------------------------------ #
@@ -134,9 +140,11 @@ class HierarchicalClock:
 
     def reset(self):
         """Reset tick counter and timers (e.g. start of new episode)."""
+        now = time.perf_counter()
         self._tick_count = 0
         self._sim_time = 0.0
-        self._wall_start = time.perf_counter()
+        self._wall_start = now
+        self._next_tick_time = now
 
     # ------------------------------------------------------------------ #
     # Real-time pacing
@@ -145,19 +153,21 @@ class HierarchicalClock:
     def sleep_until_next_tick(self):
         """Block until the next base tick should fire (real-time mode).
 
-        The sleep duration is scaled by ``1 / time_scale``, so a
-        ``time_scale`` of 10 sleeps 10× less, running the loop 10× faster
-        than real-time.
+        Uses a rolling target adjusted by ``max(target, now)`` so that
+        an overrun never causes a catch-up burst — the very next tick
+        re-anchors to wall-clock time.
 
         Call this at the **end** of your control loop body.  If processing
-        took longer than one tick period, the call returns immediately
-        (no lag accumulation).
+        took longer than one tick period, the call returns immediately.
         """
         scaled_dt = self.base_dt / self.config.time_scale
-        target = self._wall_start + self._tick_count * scaled_dt
-        remaining = target - time.perf_counter()
-        if remaining > 0:
-            time.sleep(remaining)
+        now = time.perf_counter()
+        target = self._next_tick_time
+        if target <= now:
+            self._next_tick_time = now + scaled_dt
+            return
+        time.sleep(target - now)
+        self._next_tick_time = target + scaled_dt
 
     # ------------------------------------------------------------------ #
     # Convenience

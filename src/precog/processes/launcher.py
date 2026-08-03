@@ -127,7 +127,7 @@ def _worker_level_n(
     from precog.processes.level_n import run_level_n
     from precog.model.config import PCLevelConfig, SSMConfig
 
-    ssm_dict = config_dict.pop("ssm", {})
+    ssm_dict = config_dict.get("ssm", {})
     cfg = PCLevelConfig(ssm=SSMConfig(**ssm_dict), **config_dict)
 
     kwargs: Dict[str, Any] = {
@@ -363,7 +363,6 @@ class Launcher:
                     "dt_max": lvl_cfg.ssm.dt_max,
                 },
                 "encoder_hidden": lvl_cfg.encoder_hidden,
-                "prediction_head_hidden": lvl_cfg.prediction_head_hidden,
                 "sigreg_tau": lvl_cfg.sigreg_tau,
                 "sigreg_var_threshold": lvl_cfg.sigreg_var_threshold,
                 "objective_enabled": lvl_cfg.objective_enabled,

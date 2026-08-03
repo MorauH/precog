@@ -16,7 +16,6 @@ class PCLevelConfig:
     d_representation: int
     ssm: SSMConfig
     encoder_hidden: List[int] = field(default_factory=lambda: [64])
-    prediction_head_hidden: List[int] = field(default_factory=lambda: [64])
     sigreg_tau: float = 0.999
     sigreg_var_threshold: float = 0.1
     objective_enabled: bool = False
@@ -109,7 +108,6 @@ DEFAULT_CONFIG = ModelConfig(
         PCLevelConfig(
             d_representation=32,
             ssm=SSMConfig(d_state=16, dt_min=0.001, dt_max=0.01),
-            prediction_head_hidden=[16],
             objective_enabled=True,
             objective_observable_key="forward_speed",
             objective_target_value=5.0,
@@ -119,7 +117,6 @@ DEFAULT_CONFIG = ModelConfig(
         PCLevelConfig(
             d_representation=32,
             ssm=SSMConfig(d_state=16, dt_min=0.01, dt_max=0.1),
-            prediction_head_hidden=[16],
             objective_enabled=True,
             objective_observable_key="lateral_deviation",
             objective_target_value=0.0,

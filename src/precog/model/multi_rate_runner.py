@@ -20,9 +20,6 @@ class RunnerConfig:
     batch_size: int = 1
     device: str = "cpu"
     accumulate_for_upper: bool = True
-    online_learning: bool = True
-    learning_rate: float = 1e-3
-    imitation_loss_weight: float = 1.0
 
 
 @dataclass
@@ -74,11 +71,6 @@ class MultiRateRunner:
             [] for _ in runner_cfg.level_frequencies
         ]
 
-        self._optimizers: List[torch.optim.Optimizer] = []
-        self._lr = runner_cfg.learning_rate
-        self._online_learning = runner_cfg.online_learning
-        self._ctrl_weight = runner_cfg.imitation_loss_weight
-
         ch = self.model.control_head
         if ch.output_scales is not None:
             self._action_scales = ch.output_scales.to(self.device)
@@ -86,13 +78,6 @@ class MultiRateRunner:
             self._action_scales = torch.ones(
                 self.model.config.control_dim, device=self.device
             )
-
-        ctrl_idx = self.model.control_level_idx
-        for i, level in enumerate(self.model.levels):
-            param_groups = [{"params": level.parameters()}]
-            if i == ctrl_idx:
-                param_groups.append({"params": self.model.control_head.parameters()})
-            self._optimizers.append(torch.optim.AdamW(param_groups, lr=self._lr))
 
     # ------------------------------------------------------------------ #
     # Public API

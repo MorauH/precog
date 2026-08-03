@@ -148,7 +148,6 @@ class HierarchicalPCWorldModel(nn.Module):
         batch_size: int = 1,
         device: str = "cpu",
         accumulate_for_upper: bool = True,
-        online_learning: bool = False,
     ) -> MultiRateRunner:
         if len(level_frequencies) != len(self.levels):
             raise ValueError(
@@ -161,7 +160,5 @@ class HierarchicalPCWorldModel(nn.Module):
             batch_size=batch_size,
             device=device,
             accumulate_for_upper=accumulate_for_upper,
-            online_learning=online_learning,
-            imitation_loss_weight=self.config.imitation_loss_weight,
         )
         return MultiRateRunner(self, cfg)

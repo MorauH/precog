@@ -115,31 +115,3 @@ class SIGReg(nn.Module):
         cov_loss = off.pow(2).sum() / max(1, int(mask.sum().item()))
 
         return var_loss + cov_loss
-
-    # ------------------------------------------------------------------ #
-    # Metrics (for diagnostics)
-    # ------------------------------------------------------------------ #
-
-    @torch.no_grad()
-    def covariance_metrics(self) -> dict[str, float]:
-        """Return scalar diagnostics from the running online covariance."""
-        cov = self._outer - torch.outer(self._mean, self._mean)
-        var = cov.diag()
-        avg_std = var.sqrt().mean().item()
-        min_std = var.sqrt().min().item()
-
-        D = self.d_repr
-        idx = torch.arange(D, device=cov.device)
-        mask = idx.unsqueeze(0) != idx.unsqueeze(1)
-        off = cov[mask]
-        off_rms = off.pow(2).mean().sqrt().item()
-
-        # Fraction of dims below threshold
-        below = (var.sqrt() < self.var_threshold).float().mean().item()
-
-        return {
-            "sigreg_avg_std": avg_std,
-            "sigreg_min_std": min_std,
-            "sigreg_off_rms": off_rms,
-            "sigreg_dim_below_thresh": below,
-        }

@@ -26,10 +26,13 @@ class LevelState:
 
     level_idx: int
 
-    hidden: torch.Tensor                      # (B, d_state)
+    hidden: torch.Tensor  # (B, d_state)
 
-    last_z: Optional[torch.Tensor] = None          # (B, d_repr)
-    last_pred_error: Optional[torch.Tensor] = None
+    last_z: Optional[torch.Tensor] = None  # (B, d_repr) encoder output z_t
+    last_z_pred: Optional[torch.Tensor] = None  # (B, d_repr) SSM prediction z_t+1_pred
+    last_pred_error: Optional[torch.Tensor] = (
+        None  # (B, d_repr) z_delta prediction error
+    )
 
     last_update_tick: int = 0
     last_update_sim_time: float = 0.0
@@ -38,12 +41,14 @@ class LevelState:
         self,
         hidden: torch.Tensor,
         z: torch.Tensor,
+        z_pred: torch.Tensor,
         pred_error: torch.Tensor,
         tick: int,
         sim_time: float,
     ):
         self.hidden = hidden
         self.last_z = z
+        self.last_z_pred = z_pred
         self.last_pred_error = pred_error
         self.last_update_tick = tick
         self.last_update_sim_time = sim_time
@@ -52,6 +57,8 @@ class LevelState:
         self.hidden = self.hidden.detach()
         if self.last_z is not None:
             self.last_z = self.last_z.detach()
+        if self.last_z_pred is not None:
+            self.last_z_pred = self.last_z_pred.detach()
 
     @classmethod
     def init(

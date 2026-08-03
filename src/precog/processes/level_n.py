@@ -38,9 +38,10 @@ from precog.model.config import PCLevelConfig
 
 def _snapshot_from_step(
     level_idx: int,
-    z_below: torch.Tensor,
+    signal_from_below: torch.Tensor,
     h_init: torch.Tensor,
-    pred_from_above: Optional[torch.Tensor],
+    a_t: Optional[torch.Tensor],
+    z_t_pred: Optional[torch.Tensor],
     task_target: Optional[torch.Tensor],
     x_actual: Optional[torch.Tensor],
     sigreg_mean: torch.Tensor,
@@ -49,11 +50,10 @@ def _snapshot_from_step(
 ) -> PerLevelSnapshot:
     return PerLevelSnapshot(
         level_idx=level_idx,
-        z_below=z_below.detach().cpu(),
+        signal_from_below=signal_from_below.detach().cpu(),
         h_init=h_init.detach().cpu(),
-        pred_from_above=pred_from_above.detach().cpu()
-        if pred_from_above is not None
-        else None,
+        a_t=a_t.detach().cpu() if a_t is not None else None,
+        z_t_pred=z_t_pred.detach().cpu() if z_t_pred is not None else None,
         task_target=task_target.detach().cpu() if task_target is not None else None,
         x_actual=x_actual.detach().cpu() if x_actual is not None else None,
         prev_action=prev_action.detach().cpu() if prev_action is not None else None,
@@ -119,9 +119,10 @@ def run_level_n(
 
     batch_size = 1
     h_state = level.init_hidden(batch_size, dev)
+    z_t_pred_state: Optional[torch.Tensor] = None
 
     accumulated: List[torch.Tensor] = []
-    pfa_accumulated: List[torch.Tensor] = []
+    a_t_accumulated: List[torch.Tensor] = []
 
     weight_version = 0
 
@@ -135,19 +136,19 @@ def run_level_n(
     _tick_count = 0
 
     while not stop_event.is_set():
-        z_below: Optional[torch.Tensor] = None
+        signal_from_below: Optional[torch.Tensor] = None
         if upward_reader is not None:
             raw = upward_reader.read(timeout_us=10000)
             if raw is not None:
-                z_below = raw.to(dev)
+                signal_from_below = raw.to(dev)
 
-        pred_from_above: Optional[torch.Tensor] = None
+        a_t: Optional[torch.Tensor] = None
         if downward_reader is not None:
             raw = downward_reader.read(timeout_us=5000)
             if raw is not None:
-                pred_from_above = raw.to(dev)
+                a_t = raw.to(dev)
 
-        if z_below is None:
+        if signal_from_below is None:
             time.sleep(0.0001)
             continue
 
@@ -163,12 +164,12 @@ def run_level_n(
                 _last_print = now
 
         if accumulate_for_forward:
-            accumulated.append(z_below)
-            if pred_from_above is not None:
-                pfa_accumulated.append(pred_from_above)
+            accumulated.append(signal_from_below)
+            if a_t is not None:
+                a_t_accumulated.append(a_t)
         else:
-            accumulated = [z_below]
-            pfa_accumulated = [pred_from_above] if pred_from_above is not None else []
+            accumulated = [signal_from_below]
+            a_t_accumulated = [a_t] if a_t is not None else []
 
         clock.tick()
 
@@ -179,9 +180,9 @@ def run_level_n(
             continue
 
         seq = torch.stack(accumulated, dim=1)
-        pfa_seq = None
-        if pfa_accumulated and pfa_accumulated[0] is not None:
-            pfa_seq = torch.stack(pfa_accumulated, dim=1)
+        a_seq = None
+        if a_t_accumulated and a_t_accumulated[0] is not None:
+            a_seq = torch.stack(a_t_accumulated, dim=1)
 
         task_target = None
         x_actual = None
@@ -191,17 +192,17 @@ def run_level_n(
         h_in = h_state.detach()
 
         if seq.shape[1] == 1:
-            pfa_single = pfa_seq[:, 0] if pfa_seq is not None else None
-            z_t, pred_below, h_new, eps_t, x_star = level.step(
-                seq[:, 0], h_in, pfa_single, task_target
+            a_t_single = a_seq[:, 0] if a_seq is not None else None
+            z_t, z_next_pred, h_new, z_delta, x_star = level.step(
+                seq[:, 0], h_in, a_t_single, z_t_pred_state, task_target
             )
         else:
-            z_seq, pred_seq, h_new, eps_seq, _, x_star_seq = level.forward(
-                seq, h_in, pfa_seq, task_target
+            z_seq, z_next_pred_seq, h_new, z_delta_seq, _, x_star_seq = level.forward(
+                seq, h_in, a_seq, z_t_pred_state, task_target
             )
             z_t = z_seq[:, -1]
-            pred_below = pred_seq[:, -1]
-            eps_t = eps_seq[:, -1]
+            z_next_pred = z_next_pred_seq[:, -1]
+            z_delta = z_delta_seq[:, -1]
             x_star = x_star_seq[:, -1, :] if x_star_seq is not None else None
 
         sigreg_mean = level.sigreg._mean.detach().clone()
@@ -211,13 +212,14 @@ def run_level_n(
             upward_writer.write(z_t)
 
         if downward_writer is not None:
-            downward_writer.write(pred_below)
+            downward_writer.write(z_next_pred)
 
         snap = _snapshot_from_step(
             level_idx=level_idx,
-            z_below=seq[:, 0],
+            signal_from_below=seq[:, 0],
             h_init=h_in,
-            pred_from_above=(pfa_seq[:, 0] if pfa_seq is not None else None),
+            a_t=(a_seq[:, 0] if a_seq is not None else None),
+            z_t_pred=z_t_pred_state,
             task_target=task_target,
             x_actual=x_actual,
             sigreg_mean=sigreg_mean,
@@ -227,9 +229,10 @@ def run_level_n(
         experience_ring.write(snap)
 
         h_state = h_new.detach()
+        z_t_pred_state = z_next_pred.detach()
 
         accumulated = []
-        pfa_accumulated = []
+        a_t_accumulated = []
 
         clock.sleep_until_next_tick()
 

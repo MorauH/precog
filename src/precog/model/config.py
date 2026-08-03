@@ -15,6 +15,7 @@ class SSMConfig:
 class PCLevelConfig:
     d_representation: int
     ssm: SSMConfig
+    encoder_hidden: List[int] = field(default_factory=lambda: [64])
     prediction_head_hidden: List[int] = field(default_factory=lambda: [64])
     sigreg_tau: float = 0.999
     sigreg_var_threshold: float = 0.1

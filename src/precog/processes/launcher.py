@@ -362,6 +362,7 @@ class Launcher:
                     "dt_min": lvl_cfg.ssm.dt_min,
                     "dt_max": lvl_cfg.ssm.dt_max,
                 },
+                "encoder_hidden": lvl_cfg.encoder_hidden,
                 "prediction_head_hidden": lvl_cfg.prediction_head_hidden,
                 "sigreg_tau": lvl_cfg.sigreg_tau,
                 "sigreg_var_threshold": lvl_cfg.sigreg_var_threshold,

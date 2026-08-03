@@ -42,9 +42,10 @@ class PerLevelSnapshot:
 
     level_idx: int
 
-    z_below: torch.Tensor
+    signal_from_below: torch.Tensor
     h_init: torch.Tensor
-    pred_from_above: Optional[torch.Tensor]
+    a_t: Optional[torch.Tensor]
+    z_t_pred: Optional[torch.Tensor]
     task_target: Optional[torch.Tensor]
     x_actual: Optional[torch.Tensor]
     prev_action: Optional[torch.Tensor]
@@ -193,17 +194,17 @@ class MultiRateRunner:
             else:
                 seq = self._pop_sequence_for_level(i, z_input)
 
-            pred_from_above: Optional[torch.Tensor] = None
+            a_t: Optional[torch.Tensor] = None
             if i + 1 < len(self._level_states):
                 above_state = self._level_states[i + 1]
-                if above_state.last_z is not None:
-                    above_level = self.model.levels[i + 1]
-                    with torch.no_grad():
-                        pfa = above_level.predict_downward(above_state.last_z)
+                if above_state.last_z_pred is not None:
                     T = seq.shape[1]
-                    pred_from_above = pfa.unsqueeze(1).expand(-1, T, -1)
+                    a_t = above_state.last_z_pred.unsqueeze(1).expand(-1, T, -1)
 
             h_in = state.hidden.detach()
+            z_t_pred = (
+                state.last_z_pred.detach() if state.last_z_pred is not None else None
+            )
 
             task_target = None
             x_actual = None
@@ -221,45 +222,41 @@ class MultiRateRunner:
             is_single = seq.shape[1] == 1
 
             if is_single:
-                pfa_single = (
-                    pred_from_above[:, 0] if pred_from_above is not None else None
+                a_t_single = a_t[:, 0] if a_t is not None else None
+                z_t_out, z_next_pred, h_new, z_delta, x_star = level.step(
+                    seq[:, 0], h_in, a_t_single, z_t_pred, task_target
                 )
-                z_t, _, h_new, eps_t, x_star = level.step(
-                    seq[:, 0], h_in, pfa_single, task_target
-                )
-                z_seq = z_t.unsqueeze(1)
-                epsilon = eps_t.unsqueeze(1)
+                z_seq = z_t_out.unsqueeze(1)
+                z_delta_seq = z_delta.unsqueeze(1)
+                z_next_pred_single = z_next_pred
             else:
-                z_seq, _, h_new, epsilon, _, x_star_seq = level.forward(
-                    seq, h_in, pred_from_above, task_target
+                z_seq, z_next_pred_seq, h_new, z_delta_seq, _, x_star_seq = (
+                    level.forward(seq, h_in, a_t, z_t_pred, task_target)
                 )
+                z_next_pred_single = z_next_pred_seq[:, -1]
                 x_star = x_star_seq[:, -1, :] if x_star_seq is not None else None
 
-            surprise_i = epsilon.pow(2).mean()
+            surprise_i = z_delta_seq.pow(2).mean()
             surprise_terms.append(surprise_i.detach())
 
             sigreg_mean = level.sigreg._mean.detach().clone()
             sigreg_outer = level.sigreg._outer.detach().clone()
 
-            pfa_for_replay: Optional[torch.Tensor] = None
+            a_t_for_replay: Optional[torch.Tensor] = None
             if is_single:
-                pfa_for_replay = (
-                    pred_from_above[:, 0].detach()
-                    if pred_from_above is not None
-                    else None
-                )
+                a_t_for_replay = a_t[:, 0].detach() if a_t is not None else None
             else:
-                pfa_for_replay = (
-                    pred_from_above.detach() if pred_from_above is not None else None
-                )
+                a_t_for_replay = a_t.detach() if a_t is not None else None
 
-            z_below_for_replay = seq[:, 0].detach() if is_single else seq.detach()
+            signal_for_replay = seq[:, 0].detach() if is_single else seq.detach()
+            z_t_pred_for_replay = z_t_pred.detach() if z_t_pred is not None else None
 
             snapshot = PerLevelSnapshot(
                 level_idx=i,
-                z_below=z_below_for_replay,
+                signal_from_below=signal_for_replay,
                 h_init=h_in.detach(),
-                pred_from_above=pfa_for_replay,
+                a_t=a_t_for_replay,
+                z_t_pred=z_t_pred_for_replay,
                 task_target=task_target.detach() if task_target is not None else None,
                 x_actual=x_actual.detach() if x_actual is not None else None,
                 prev_action=(
@@ -276,7 +273,8 @@ class MultiRateRunner:
             state.update(
                 hidden=h_new.detach(),
                 z=z_seq[:, -1].detach(),
-                pred_error=epsilon.detach(),
+                z_pred=z_next_pred_single.detach(),
+                pred_error=z_delta_seq[:, -1].detach(),
                 tick=current_tick,
                 sim_time=sim_time,
             )
@@ -306,18 +304,18 @@ class MultiRateRunner:
         self,
         obs_dict: Dict[str, torch.Tensor],
         prev_action: Optional[torch.Tensor] = None,
-        pred_from_above: Optional[torch.Tensor] = None,
+        a_t: Optional[torch.Tensor] = None,
     ) -> ForwardOutput:
         """Lightweight forward pass for L0 process — level 0 only.
 
-        Runs encoding, Level 0 SSM step, and control head. Does NOT
+        Runs encoding, Level 0 encoder + SSM step, and control head. Does NOT
         iterate upper levels (those run in separate level_n processes).
 
         Args:
             obs_dict: Raw observation dict.
             prev_action: Previous action for imitation loss replay.
-            pred_from_above: Top-down prediction from L1 (read from
-                downward ShmTensorSlot). If None, no top-down signal.
+            a_t: Top-down signal from L1 (SSM output z_t+1_pred). If None,
+                 no top-down signal.
 
         Returns:
             ForwardOutput with only level 0's snapshot and states.
@@ -349,6 +347,7 @@ class MultiRateRunner:
         state = self._level_states[0]
         lvl_cfg = self.model.config.level_configs[0]
         h_in = state.hidden.detach()
+        z_t_pred = state.last_z_pred.detach() if state.last_z_pred is not None else None
 
         task_target = None
         x_actual = None
@@ -362,24 +361,23 @@ class MultiRateRunner:
             if raw is not None:
                 x_actual = raw.reshape(1, -1)[:, :1]
 
-        pfa_single = (
-            pred_from_above.detach().to(self.device)
-            if pred_from_above is not None
-            else None
-        )
-        z_t, _, h_new, eps_t, x_star = level.step(
-            z_level0, h_in, pfa_single, task_target
+        a_t_single = a_t.detach().to(self.device) if a_t is not None else None
+        z_t_out, z_next_pred, h_new, z_delta, x_star = level.step(
+            z_level0, h_in, a_t_single, z_t_pred, task_target
         )
 
-        surprise_i = eps_t.pow(2).mean()
+        surprise_i = z_delta.pow(2).mean()
         sigreg_mean = level.sigreg._mean.detach().clone()
         sigreg_outer = level.sigreg._outer.detach().clone()
 
+        z_t_pred_for_replay = z_t_pred.detach() if z_t_pred is not None else None
+
         snapshot = PerLevelSnapshot(
             level_idx=0,
-            z_below=z_level0.detach(),
+            signal_from_below=z_level0.detach(),
             h_init=h_in.detach(),
-            pred_from_above=pfa_single.detach() if pfa_single is not None else None,
+            a_t=a_t_single.detach() if a_t_single is not None else None,
+            z_t_pred=z_t_pred_for_replay,
             task_target=task_target.detach() if task_target is not None else None,
             x_actual=x_actual.detach() if x_actual is not None else None,
             prev_action=prev_action.detach() if prev_action is not None else None,
@@ -390,13 +388,14 @@ class MultiRateRunner:
 
         state.update(
             hidden=h_new.detach(),
-            z=z_t.detach(),
-            pred_error=eps_t.detach(),
+            z=z_t_out.detach(),
+            z_pred=z_next_pred.detach(),
+            pred_error=z_delta.detach(),
             tick=current_tick,
             sim_time=sim_time,
         )
 
-        action = self.model.control_head(z_t.unsqueeze(1))[:, -1]
+        action = self.model.control_head(z_t_out.unsqueeze(1))[:, -1]
 
         return ForwardOutput(
             action=action,
@@ -442,11 +441,14 @@ class MultiRateRunner:
 
             for snap in snapshots:
                 if snap.is_single_step:
-                    z_below = snap.z_below.to(self.device).unsqueeze(0)
+                    signal = snap.signal_from_below.to(self.device).unsqueeze(0)
                     h_in = snap.h_init.to(self.device)
-                    pfa: Optional[torch.Tensor] = (
-                        snap.pred_from_above.to(self.device)
-                        if snap.pred_from_above is not None
+                    a_t: Optional[torch.Tensor] = (
+                        snap.a_t.to(self.device) if snap.a_t is not None else None
+                    )
+                    z_t_pred_in: Optional[torch.Tensor] = (
+                        snap.z_t_pred.to(self.device)
+                        if snap.z_t_pred is not None
                         else None
                     )
                     tt: Optional[torch.Tensor] = (
@@ -455,15 +457,20 @@ class MultiRateRunner:
                         else None
                     )
 
-                    z_t, _, _, eps_t, x_star = level.step(z_below[0], h_in, pfa, tt)
-                    epsilon = eps_t.unsqueeze(0)
-                    z_seq = z_t.unsqueeze(0)
+                    z_t_out, _, _, z_delta, x_star = level.step(
+                        signal[0], h_in, a_t, z_t_pred_in, tt
+                    )
+                    z_delta_seq = z_delta.unsqueeze(0)
+                    z_seq = z_t_out.unsqueeze(0)
                 else:
-                    z_below = snap.z_below.to(self.device)
+                    signal = snap.signal_from_below.to(self.device)
                     h_in = snap.h_init.to(self.device)
-                    pfa_seq: Optional[torch.Tensor] = (
-                        snap.pred_from_above.to(self.device)
-                        if snap.pred_from_above is not None
+                    a_seq: Optional[torch.Tensor] = (
+                        snap.a_t.to(self.device) if snap.a_t is not None else None
+                    )
+                    z_t_pred_in: Optional[torch.Tensor] = (
+                        snap.z_t_pred.to(self.device)
+                        if snap.z_t_pred is not None
                         else None
                     )
                     tt: Optional[torch.Tensor] = (
@@ -472,12 +479,12 @@ class MultiRateRunner:
                         else None
                     )
 
-                    z_seq, _, _, epsilon, _, x_star_seq = level.forward(
-                        z_below, h_in, pfa_seq, tt
+                    z_seq, _, _, z_delta_seq, _, x_star_seq = level.forward(
+                        signal, h_in, a_seq, z_t_pred_in, tt
                     )
                     x_star = x_star_seq[:, -1, :] if x_star_seq is not None else None
 
-                surprise_i = epsilon.pow(2).mean()
+                surprise_i = z_delta_seq.pow(2).mean()
                 sigreg_loss = level.sigreg.compute_loss_online()
                 loss = surprise_i + sigreg_loss
                 loss_terms.append(loss)
@@ -672,11 +679,14 @@ def replay_learn_level(
 
     for snap in snapshots:
         if snap.is_single_step:
-            z_below = snap.z_below.to(device, non_blocking=True)
+            signal = snap.signal_from_below.to(device, non_blocking=True)
             h_in = snap.h_init.to(device, non_blocking=True)
-            pfa: Optional[torch.Tensor] = (
-                snap.pred_from_above.to(device, non_blocking=True)
-                if snap.pred_from_above is not None
+            a_t_rl: Optional[torch.Tensor] = (
+                snap.a_t.to(device, non_blocking=True) if snap.a_t is not None else None
+            )
+            z_t_pred_rl: Optional[torch.Tensor] = (
+                snap.z_t_pred.to(device, non_blocking=True)
+                if snap.z_t_pred is not None
                 else None
             )
             tt: Optional[torch.Tensor] = (
@@ -685,27 +695,30 @@ def replay_learn_level(
                 else None
             )
 
-            z_t, _, _, eps_t, x_star = level.step(z_below, h_in, pfa, tt)
-            epsilon = eps_t.unsqueeze(0)
-            z_seq = z_t.unsqueeze(0)
+            z_t_out, _, _, z_delta, x_star = level.step(
+                signal, h_in, a_t_rl, z_t_pred_rl, tt
+            )
+            z_delta_seq = z_delta.unsqueeze(0)
+            z_seq = z_t_out.unsqueeze(0)
         else:
-            z_below = snap.z_below.to(device)
+            signal = snap.signal_from_below.to(device)
             h_in = snap.h_init.to(device)
-            pfa_seq: Optional[torch.Tensor] = (
-                snap.pred_from_above.to(device)
-                if snap.pred_from_above is not None
-                else None
+            a_seq_rl: Optional[torch.Tensor] = (
+                snap.a_t.to(device) if snap.a_t is not None else None
+            )
+            z_t_pred_rl: Optional[torch.Tensor] = (
+                snap.z_t_pred.to(device) if snap.z_t_pred is not None else None
             )
             tt: Optional[torch.Tensor] = (
                 snap.task_target.to(device) if snap.task_target is not None else None
             )
 
-            z_seq, _, _, epsilon, _, x_star_seq = level.forward(
-                z_below, h_in, pfa_seq, tt
+            z_seq, _, _, z_delta_seq, _, x_star_seq = level.forward(
+                signal, h_in, a_seq_rl, z_t_pred_rl, tt
             )
             x_star = x_star_seq[:, -1, :] if x_star_seq is not None else None
 
-        surprise_i = epsilon.pow(2).mean()
+        surprise_i = z_delta_seq.pow(2).mean()
         sigreg_loss = level.sigreg.compute_loss_online()
         loss = surprise_i + sigreg_loss
 

@@ -215,18 +215,18 @@ def run_level0(
                     1, config.control_dim, dtype=torch.float32, device=device
                 )
 
-            # Read pred_from_above from L1 via downward slot (strictly non-blocking)
-            pred_from_above = None
+            # Read a_t (top-down prediction) from L1 via downward slot (strictly non-blocking)
+            a_t = None
             if downward_reader is not None:
                 raw = downward_reader.read(timeout_us=0)
                 if raw is not None:
-                    pred_from_above = raw.to(torch.device(device))
+                    a_t = raw.to(torch.device(device))
 
             # Level 0 forward pass only (no upper levels)
             fwd: ForwardOutput = runner.forward_level0(
                 obs,
                 prev_action,
-                pred_from_above=pred_from_above,
+                a_t=a_t,
             )
 
             # Send z0 upward to L1

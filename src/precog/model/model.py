@@ -101,43 +101,24 @@ class HierarchicalPCWorldModel(nn.Module):
         # ---------------------------------------------------------------- #
         # Phase 1 — Bottom-up: raw representations (no top-down)
         # ---------------------------------------------------------------- #
-        z_below_inputs: List[torch.Tensor] = []
-        z_levels_raw: List[torch.Tensor] = []
-        pred_below_list: List[torch.Tensor] = []
+        z_levels: List[torch.Tensor] = []
         prediction_errors: List[torch.Tensor] = []
         h_new_list: List[torch.Tensor] = []
         sigreg_losses: List[torch.Tensor] = []
 
         curr = z_level
         for i, level in enumerate(self.levels):
-            z_below_inputs.append(curr)
-            z_seq, pred_below_seq, h_new, epsilon, sigreg_loss, _ = level.forward(
-                curr, hidden_states[i], None
+            z_seq, _, h_new, z_delta_seq, sigreg_loss, _ = level.forward(
+                curr, hidden_states[i], None, None, None
             )
             h_new_list.append(h_new)
-            z_levels_raw.append(z_seq)
-            pred_below_list.append(pred_below_seq)
-            prediction_errors.append(epsilon)
+            z_levels.append(z_seq)
+            prediction_errors.append(z_delta_seq)
             sigreg_losses.append(sigreg_loss)
             curr = z_seq
 
-        # ---------------------------------------------------------------- #
-        # Phase 2 — Top-down: correct lower levels from above
-        # ---------------------------------------------------------------- #
-        level_outputs = list(z_levels_raw)
-        for i in range(len(self.levels) - 2, -1, -1):
-            pred_from_above_seq = pred_below_list[i + 1]
-            z_corr, pred_below_corr, eps_corr = self.levels[
-                i
-            ].apply_top_down_correction(
-                z_levels_raw[i], z_below_inputs[i], pred_from_above_seq
-            )
-            level_outputs[i] = z_corr
-            pred_below_list[i] = pred_below_corr
-            prediction_errors[i] = eps_corr
-
         ctrl_idx = self.control_level_idx
-        z_ctrl = level_outputs[ctrl_idx]
+        z_ctrl = z_levels[ctrl_idx]
         action_pred = self.control_head(z_ctrl)
 
         if not return_all:
@@ -145,7 +126,7 @@ class HierarchicalPCWorldModel(nn.Module):
 
         return {
             "action_pred": action_pred,
-            "z_levels": level_outputs,
+            "z_levels": z_levels,
             "prediction_errors": prediction_errors,
             "total_surprise": sum(e.pow(2).mean() for e in prediction_errors),
             "hidden_states": h_new_list,

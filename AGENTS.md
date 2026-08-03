@@ -27,9 +27,7 @@ uv sync --extra cuda    # CUDA 13.2 (mutually exclusive with cpu)
 
 ```bash
 python src/precog/test_read_env.py   # Read-only telemetry smoke test
-python -m precog.main                 # Legacy synchronous control loop
 python -m precog.processes.cli        # Pipelined actor (decoupled learning)
-precog                               # After install (entry point → pipelined)
 ```
 
 ### Lint & Format
@@ -73,16 +71,21 @@ src/precog/
     source_selector.py  Multi-source input selection
   model/
     model.py            HierarchicalPCWorldModel entry point
-    pc_level.py         Single PC level with SSM
+    pc_level_jepa.py    JEPA PC level (encoder + SSM)
     ssm.py              Selective State Space Model (Mamba-like)
     config.py           ModelConfig, DEFAULT_CONFIG
-    diagnostics.py      Online metrics collection
     hierarchical_clock.py  Multi-rate tick scheduling
     level_state.py      Per-level runtime state
-    multi_rate_runner.py   Multi-frequency clock + tick orchestrator
+    multi_rate_runner.py   Multi-frequency clock + forward orchestrator
+  processes/
+    level0.py           L0 forward process (ROS → action)
+    level_n.py          Generic upper-level forward process
+    learner.py          Learner process (replay + backward + step)
+    launcher.py         Orchestrator / supervisor
+    cli.py              CLI entry point
+    action_utils.py     Shared ROS action helpers
   dashboard/
     server.py           FastAPI live monitoring server (lazy import)
-  main.py               Full control loop (env + model + runner)
 ```
 
 **Data flow**: `ROS topics → codec (msg→array) → snapshot → transforms (cross-key feature

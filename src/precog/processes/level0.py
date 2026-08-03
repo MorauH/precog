@@ -31,30 +31,9 @@ from precog.model import (
 )
 from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
 from precog.messaging import ShmRingBuffer, WeightSync
+from precog.processes.action_utils import action_from_obs, action_to_dict
 
 ENV_CONFIG_PATH = "./src/precog/envs/ros/env_config.yaml"
-
-
-def _action_to_dict(tensor: torch.Tensor, keys: list[str]) -> dict[str, np.ndarray]:
-    values = tensor[0].detach().cpu().numpy()
-    if values.ndim == 0:
-        values = np.array([values.item()])
-    return {k: values[i].item() for i, k in enumerate(keys)}
-
-
-def _action_from_obs(
-    obs: dict, action_keys: list[str], device: torch.device
-) -> Optional[torch.Tensor]:
-    values = []
-    for k in action_keys:
-        v = obs.get(f"expert_{k}")
-        if v is None:
-            return None
-        val = v.squeeze()
-        if val.ndim == 0:
-            val = val.unsqueeze(-1)
-        values.append(val)
-    return torch.stack(values, dim=-1).to(device)
 
 
 def _set_realtime(priority: int, core: Optional[int]) -> None:
@@ -200,7 +179,7 @@ def run_level0(
                     blend_acc = new_acc
                     source_selector.blend_ratio_acc = blend_acc
 
-            expert_action = _action_from_obs(obs, action_keys, device)
+            expert_action = action_from_obs(obs, action_keys, device)
 
             if source_selector.last_output_valid:
                 prev_action = torch.tensor(
@@ -260,7 +239,7 @@ def run_level0(
             _hz = 0.9 * _hz + 0.1 / max(now - _last_tick_time, 1e-6)
             _last_tick_time = now
 
-            act_dict = _action_to_dict(fwd.action, action_keys)
+            act_dict = action_to_dict(fwd.action, action_keys)
             obs = env.step(act_dict)
             tick_count += 1
 

@@ -26,7 +26,7 @@ def example_realtime_control(model: HierarchicalPCWorldModel, env):
     for _ in range(10_000):
         runner.clock.tick()
 
-        result = runner.tick(obs, prev_action)
+        result = runner.forward(obs, prev_action)
 
         # result.updated_levels tells you which levels fired this tick
         # e.g. tick 1   → [0]          (100 Hz level only)
@@ -57,7 +57,7 @@ def example_fast_simulation(model: HierarchicalPCWorldModel, sim_env):
     obs, prev_action = sim_env.reset()
 
     for _ in range(100_000):
-        result = runner.tick(obs, prev_action)
+        result = runner.forward(obs, prev_action)
         obs, prev_action = sim_env.step(result.action)
         runner.clock.sleep_until_next_tick()  # sleeps 10× less
 
@@ -81,7 +81,7 @@ def example_max_speed_rollout(model: HierarchicalPCWorldModel, sim_env):
     obs, prev_action = sim_env.reset()
 
     for _ in range(10_000):
-        result = runner.tick(obs, prev_action)
+        result = runner.forward(obs, prev_action)
         trajectory.append(
             {
                 "action": result.action.cpu(),
@@ -113,7 +113,7 @@ def example_dynamic_time_scale(model: HierarchicalPCWorldModel, sim_env):
     obs, prev_action = sim_env.reset()
 
     for step in range(50_000):
-        result = runner.tick(obs, prev_action)
+        result = runner.forward(obs, prev_action)
 
         # Slow to real-time when surprise is high (something unexpected)
         if result.total_surprise and result.total_surprise > 0.5:
@@ -141,7 +141,7 @@ def example_inspect_updates(model: HierarchicalPCWorldModel, env):
     obs, prev_action = env.reset()
 
     for tick_i in range(200):
-        result = runner.tick(obs, prev_action)
+        result = runner.forward(obs, prev_action)
         obs, prev_action = env.step(result.action)
 
         # Print a summary every 100 ticks
@@ -213,7 +213,7 @@ def example_episode_reset(model: HierarchicalPCWorldModel, env):
         obs, prev_action = env.reset()
 
         for _ in range(1000):
-            result = runner.tick(obs, prev_action)
+            result = runner.forward(obs, prev_action)
             obs, prev_action = env.step(result.action)
             runner.clock.sleep_until_next_tick()
 

@@ -11,22 +11,6 @@ from .config import ModelConfig
 from .multi_rate_runner import MultiRateRunner, RunnerConfig
 
 
-def _probe_compile_backends() -> list[str]:
-    working: list[str] = []
-
-    @torch.compile(backend="inductor")
-    def _probe(x: torch.Tensor) -> torch.Tensor:
-        return x.matmul(x.t())
-
-    try:
-        _probe(torch.randn(4, 4))
-        working.append("inductor")
-    except Exception:
-        pass
-
-    return working
-
-
 class HierarchicalPCWorldModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -134,26 +118,6 @@ class HierarchicalPCWorldModel(nn.Module):
         }
 
     # ------------------------------------------------------------------ #
-    # TorchScript / torch.compile acceleration
-    # ------------------------------------------------------------------ #
-
-    def compile(self, mode: str = "reduce-overhead"):
-        backends = _probe_compile_backends()
-        if not backends:
-            return
-
-        backend = backends[0]
-        for m in [*self.levels, self.control_head]:
-            for attr in ("step", "forward"):
-                fn = getattr(m, attr, None)
-                if fn is None:
-                    continue
-                try:
-                    setattr(m, attr, torch.compile(fn, dynamic=False, backend=backend))
-                except Exception:
-                    pass
-
-    # ------------------------------------------------------------------ #
     # Weight accessors for inter-process sync
     # ------------------------------------------------------------------ #
 
@@ -184,7 +148,7 @@ class HierarchicalPCWorldModel(nn.Module):
         batch_size: int = 1,
         device: str = "cpu",
         accumulate_for_upper: bool = True,
-        online_learning: bool = True,
+        online_learning: bool = False,
     ) -> MultiRateRunner:
         if len(level_frequencies) != len(self.levels):
             raise ValueError(

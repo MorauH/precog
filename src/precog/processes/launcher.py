@@ -3,9 +3,8 @@ Launcher: orchestrates spawning of all processes, monitors staleness,
 handles Learner crash recovery, and coordinates startup/shutdown.
 
 Spawns:
-  - Level 0 process (ROS bridge + forward + control head)
-  - Level 1+ processes (one per upper level, with inter-level channels)
-  - Learner process (replay + backward + step)
+  - World process (interface with env & calc control outputs)
+  - Level processes (one per level, with inter-level channels)
   - Dashboard (thread in L0 or standalone)
 
 Channel inventory (total: 4N-2):
@@ -40,73 +39,35 @@ from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
 ENV_CONFIG_PATH = "./src/precog/envs/ros/env_config.yaml"
 
 
-def _worker_l0(
+def _worker_world(
     stop_event,
-    experience_rings,
-    weight_syncs,
     headless,
     dashboard_port,
-    level_frequencies,
+    frequency,
     upward_writer_proxy,
     downward_reader_proxy,
     rt_priority,
     rt_core,
 ):
-    """Wrapper that catches exceptions in the L0 worker."""
-    from precog.processes.level0 import run_level0
+    """Wrapper that catches exceptions in the world worker."""
+    from precog.processes.world import run_world
 
     try:
-        run_level0(
+        run_world(
             stop_event,
-            experience_rings,
-            weight_syncs,
             headless=headless,
             dashboard_port=dashboard_port,
-            level_frequencies=level_frequencies,
+            frequency=frequency,
             upward_writer_proxy=upward_writer_proxy,
             downward_reader_proxy=downward_reader_proxy,
             rt_priority=rt_priority,
             rt_core=rt_core,
         )
     except Exception as e:
-        print(f"[Launcher] L0 process crashed: {e}", file=sys.stderr)
+        print(f"[Launcher] World process crashed: {e}", file=sys.stderr)
         import traceback
 
         traceback.print_exc()
-
-
-def _worker_learner(
-    stop_event,
-    experience_rings,
-    weight_syncs,
-    config,
-    device,
-    learning_rate,
-    ctrl_weight,
-    staleness_max,
-    sync_interval,
-):
-    """Wrapper that catches exceptions in the Learner worker."""
-    from precog.processes.learner import run_learner
-
-    try:
-        run_learner(
-            stop_event,
-            experience_rings,
-            weight_syncs,
-            config=config,
-            device=device,
-            learning_rate=learning_rate,
-            ctrl_weight=ctrl_weight,
-            staleness_max=staleness_max,
-            sync_interval_seconds=sync_interval,
-        )
-    except Exception as e:
-        print(f"[Launcher] Learner process crashed: {e}", file=sys.stderr)
-        import traceback
-
-        traceback.print_exc()
-
 
 def _worker_level_n(
     stop_event,
@@ -115,15 +76,13 @@ def _worker_level_n(
     d_below,
     d_above,
     frequency,
-    experience_ring,
-    weight_sync,
     upward_reader,
     upward_writer,
     downward_reader,
     downward_writer,
     device,
 ):
-    """Wrapper that catches exceptions in an upper-level worker."""
+    """Wrapper that catches exceptions in an level worker."""
     from precog.processes.level_n import run_level_n
     from precog.model.config import PCLevelConfig, SSMConfig
 
@@ -138,8 +97,6 @@ def _worker_level_n(
         "d_below": d_below,
         "d_above": d_above,
         "frequency": frequency,
-        "experience_ring": experience_ring,
-        "weight_sync": weight_sync,
         "device": device,
         "obj_key": cfg.objective_observable_key,
         "obj_target": cfg.objective_target_value,
@@ -193,7 +150,6 @@ class Launcher:
     def __init__(
         self,
         num_levels: int = 2,
-        ctrl_level_idx: int = 0,
         *,
         device: Optional[str] = None,
         headless: bool = True,
@@ -207,7 +163,6 @@ class Launcher:
         rt_core: Optional[int] = None,
     ):
         self._num_levels = num_levels
-        self._ctrl_level_idx = ctrl_level_idx
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = device
@@ -222,13 +177,9 @@ class Launcher:
         self._rt_core = rt_core
 
         self._stop_event: Optional[multiprocessing.Event] = None
-        self._l0_process: Optional[multiprocessing.Process] = None
-        self._learner_process: Optional[multiprocessing.Process] = None
-        self._upper_processes: List[multiprocessing.Process] = []
-        self._upper_level_kwargs: List[Dict[str, Any]] = []
-
-        self._experience_rings: List[ShmRingBuffer] = []
-        self._weight_syncs: List[WeightSync] = []
+        self._world_process: Optional[multiprocessing.Process] = None
+        self._level_processes: List[multiprocessing.Process] = []
+        self._level_kwargs: List[Dict[str, Any]] = []
 
         self._upward_slots: List[ShmTensorSlot] = []
         self._downward_slots: List[ShmTensorSlot] = []
@@ -255,19 +206,14 @@ class Launcher:
         freqs = self._auto_frequencies()
 
         self._create_channels(ctx)
-        self._spawn_learner(ctx)
-        self._spawn_upper_levels(ctx, freqs)
-        self._spawn_l0(ctx, freqs)
+        self._spawn_world(ctx)
+        self._spawn_levels(ctx, freqs)
 
         self._supervise()
 
     def _create_channels(self, ctx) -> None:
         """Create all inter-process communication channels."""
         config = self._config
-
-        for i in range(self._num_levels):
-            self._experience_rings.append(ShmRingBuffer(f"exp_L{i}"))
-            self._weight_syncs.append(WeightSync(f"sync_L{i}", i, mp_ctx=ctx))
 
         for i in range(self._num_levels - 1):
             lvl_cfg = config.level_configs[i]
@@ -279,35 +225,13 @@ class Launcher:
             slot_down = ShmTensorSlot(f"down_L{i + 1}_to_L{i}", (1, d_repr))
             self._downward_slots.append(slot_down)
 
-    def _spawn_learner(self, ctx) -> None:
-        learner_kwargs = {
-            "stop_event": self._stop_event,
-            "experience_rings": self._experience_rings,
-            "weight_syncs": self._weight_syncs,
-            "config": self._config,
-            "device": self._device,
-            "learning_rate": self._learning_rate,
-            "ctrl_weight": self._ctrl_weight,
-            "staleness_max": self._staleness_max,
-            "sync_interval": self._sync_interval,
-        }
-
-        #self._learner_process = ctx.Process(
-        #    target=_worker_learner,
-        #    kwargs=learner_kwargs,
-        #    name="learner",
-        #    daemon=True,
-        #)
-        #self._learner_process.start()
-        #print(f"[Launcher] Learner process started (pid={self._learner_process.pid})")
-
-    def _spawn_upper_levels(self, ctx, freqs: List[float]) -> None:
+    def _spawn_levels(self, ctx, freqs: List[float]) -> None:
         config = self._config
 
-        for i in range(1, self._num_levels):
+        for i in range(0, self._num_levels):
             lvl_cfg = config.level_configs[i]
 
-            d_below = config.level_configs[i - 1].d_representation
+            d_below = config.level_configs[i - 1].d_representation if i != 0 else None
             d_above = (
                 config.level_configs[i + 1].d_representation
                 if i + 1 < self._num_levels
@@ -381,8 +305,6 @@ class Launcher:
                 "d_below": d_below,
                 "d_above": d_above,
                 "frequency": freqs[i],
-                "experience_ring": self._experience_rings[i],
-                "weight_sync": self._weight_syncs[i],
                 "upward_reader": upward_reader,
                 "upward_writer": upward_writer,
                 "downward_reader": downward_reader,
@@ -390,7 +312,7 @@ class Launcher:
                 "device": self._device,
             }
 
-            self._upper_level_kwargs.append(kwargs)
+            self._level_kwargs.append(kwargs)
 
             proc = ctx.Process(
                 target=_worker_level_n,
@@ -399,49 +321,46 @@ class Launcher:
                 daemon=True,
             )
             proc.start()
-            self._upper_processes.append(proc)
+            self._level_processes.append(proc)
             print(f"[Launcher] L{i} process started (pid={proc.pid})")
 
-    def _spawn_l0(self, ctx, freqs: List[float]) -> None:
+    def _spawn_world(self, ctx, freq: float) -> None:
         config = self._config
 
         upward_writer_proxy = None
         downward_reader_proxy = None
 
-        if self._num_levels > 1:
-            slot_up = self._upward_slots[0]
-            upward_writer_proxy = (
-                slot_up.name,
-                slot_up.shape,
-                str(slot_up._dtype),
-            )
-            slot_down = self._downward_slots[0]
-            downward_reader_proxy = (
-                slot_down.name,
-                slot_down.shape,
-                str(slot_down._dtype),
-            )
+        slot_up = self._upward_slots[0]
+        upward_writer_proxy = (
+            slot_up.name,
+            slot_up.shape,
+            str(slot_up._dtype),
+        )
+        slot_down = self._downward_slots[0]
+        downward_reader_proxy = (
+            slot_down.name,
+            slot_down.shape,
+            str(slot_down._dtype),
+        )
 
-        l0_kwargs = {
+        world_kwargs = {
             "stop_event": self._stop_event,
-            "experience_rings": self._experience_rings,
-            "weight_syncs": self._weight_syncs,
             "headless": self._headless,
             "dashboard_port": self._dashboard_port,
-            "level_frequencies": freqs,
+            "frequency": freq,
             "upward_writer_proxy": upward_writer_proxy,
             "downward_reader_proxy": downward_reader_proxy,
             "rt_priority": self._rt_priority,
             "rt_core": self._rt_core,
         }
 
-        self._l0_process = ctx.Process(
-            target=_worker_l0,
-            kwargs=l0_kwargs,
-            name="level0",
+        self._world_process = ctx.Process(
+            target=_worker_world,
+            kwargs=world_kwargs,
+            name="world",
         )
-        self._l0_process.start()
-        print(f"[Launcher] L0 process started (pid={self._l0_process.pid})")
+        self._world_process.start()
+        print(f"[Launcher] World process started (pid={self._world_process.pid})")
 
     def _supervise(self) -> None:
         """Monitor child processes and handle crashes."""
@@ -455,63 +374,29 @@ class Launcher:
 
         try:
             while True:
-                if self._l0_process is not None and not self._l0_process.is_alive():
-                    print("[Launcher] L0 process exited, shutting down")
+                if self._world_process is not None and not self._world_process.is_alive():
+                    print("[Launcher] World process exited, shutting down")
                     self.shutdown()
                     break
 
-                #if (
-                #    self._learner_process is not None
-                #    and not self._learner_process.is_alive()
-                #):
-                #    print("[Launcher] Learner process crashed!")
-                #    if not self._stop_event.is_set():
-                #        print("[Launcher] Restarting Learner...")
-                #        self._start_learner()
-
-                for i, proc in enumerate(self._upper_processes):
+                for i, proc in enumerate(self._level_processes):
                     if proc is not None and not proc.is_alive():
-                        print(f"[Launcher] L{i + 1} process crashed!")
+                        print(f"[Launcher] L{i} process crashed!")
                         if not self._stop_event.is_set():
-                            print(f"[Launcher] Restarting L{i + 1}...")
-                            self._restart_upper_level(i)
+                            print(f"[Launcher] Restarting L{i}...")
+                            self._restart_level(i)
 
                 time.sleep(0.5)
 
         except KeyboardInterrupt:
             self.shutdown()
 
-    def _start_learner(self) -> None:
-        """Start or restart the Learner process."""
-        ctx = multiprocessing.get_context("spawn")
-
-        learner_kwargs = {
-            "stop_event": self._stop_event,
-            "experience_rings": self._experience_rings,
-            "weight_syncs": self._weight_syncs,
-            "config": self._config,
-            "device": self._device,
-            "learning_rate": self._learning_rate,
-            "ctrl_weight": self._ctrl_weight,
-            "staleness_max": self._staleness_max,
-            "sync_interval": self._sync_interval,
-        }
-
-        self._learner_process = ctx.Process(
-            target=_worker_learner,
-            kwargs=learner_kwargs,
-            name="learner",
-            daemon=True,
-        )
-        self._learner_process.start()
-        print(f"[Launcher] Learner process restarted (pid={self._learner_process.pid})")
-
-    def _restart_upper_level(self, idx: int) -> None:
-        if idx >= len(self._upper_level_kwargs):
-            print(f"[Launcher] No saved kwargs for upper level idx={idx}")
+    def _restart_level(self, idx: int) -> None:
+        if idx >= len(self._level_kwargs):
+            print(f"[Launcher] No saved kwargs for level idx={idx}")
             return
         ctx = multiprocessing.get_context("spawn")
-        kwargs = self._upper_level_kwargs[idx]
+        kwargs = self._level_kwargs[idx]
         level_idx = kwargs["level_idx"]
         proc = ctx.Process(
             target=_worker_level_n,
@@ -520,10 +405,10 @@ class Launcher:
             daemon=True,
         )
         proc.start()
-        if idx < len(self._upper_processes):
-            self._upper_processes[idx] = proc
+        if idx < len(self._level_processes):
+            self._level_processes[idx] = proc
         else:
-            self._upper_processes.append(proc)
+            self._level_processes.append(proc)
         print(f"[Launcher] L{level_idx} process restarted (pid={proc.pid})")
 
     def shutdown(self) -> None:
@@ -531,16 +416,13 @@ class Launcher:
         if self._stop_event is not None:
             self._stop_event.set()
 
-        all_procs = [self._learner_process, self._l0_process] + self._upper_processes
+        all_procs = [self._world_process] + self._level_processes
         for proc in all_procs:
             if proc is not None and proc.is_alive():
                 proc.join(timeout=5.0)
                 if proc.is_alive():
                     proc.terminate()
                     proc.join(timeout=2.0)
-
-        for rb in self._experience_rings:
-            rb.close()
 
         for slot in self._upward_slots:
             slot.close()

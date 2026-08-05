@@ -123,6 +123,11 @@ DEFAULT_CONFIG = ModelConfig(
             objective_ae_weight=1.0,
             objective_task_weight=0.1,
         ),
+        PCLevelConfig(
+            d_representation=64,
+            ssm=SSMConfig(d_state=32, dt_min=0.1, dt_max=1.0),
+            objective_enabled=False,
+        ),
     ],
     control_head=ControlHeadConfig(
         hidden_dims=[16, 8], output_dim=2, output_scales=[0.5, 15.0]

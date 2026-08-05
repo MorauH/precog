@@ -36,8 +36,8 @@ def main():
     parser.add_argument(
         "--num-levels",
         type=int,
-        default=2,
-        help="Number of PC levels (default: 2)",
+        default=3,
+        help="Number of PC levels (default: 3)",
     )
     parser.add_argument(
         "--lr",
@@ -66,8 +66,8 @@ def main():
     parser.add_argument(
         "--level-frequencies",
         type=str,
-        default="200,100",
-        help="Comma-separated level frequencies in Hz (default: 200,100)",
+        default="200,100,50",
+        help="Comma-separated level frequencies in Hz (default: 200,100,50)",
     )
     parser.add_argument(
         "--rt-priority",

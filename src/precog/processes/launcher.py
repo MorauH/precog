@@ -136,6 +136,7 @@ def _worker_level_n(
         "device": device,
         "obj_key": cfg.objective_observable_key,
         "obj_target": cfg.objective_target_value,
+        "lr": 1e-3,
     }
 
     _slots: list[ShmTensorSlot] = []
@@ -198,7 +199,7 @@ class Launcher:
 
     def __init__(
         self,
-        num_levels: int = 2,
+        num_levels: int = 3,
         *,
         device: Optional[str] = None,
         headless: bool = False,
@@ -271,13 +272,15 @@ class Launcher:
 
         # Slots 1..n-1: between PCLevels
         for i in range(self._num_levels - 1):
-            lvl_cfg = config.level_configs[i]
-            d_repr = lvl_cfg.d_representation
+            lower_cfg = config.level_configs[i]
+            upper_cfg = config.level_configs[i + 1]
+            d_repr_lower = lower_cfg.d_representation
+            d_repr_upper = upper_cfg.d_representation
 
-            slot_up = ShmTensorSlot(f"up_L{i}_to_L{i + 1}", (1, d_repr))
+            slot_up = ShmTensorSlot(f"up_L{i}_to_L{i + 1}", (1, d_repr_lower))
             self._upward_slots.append(slot_up)
 
-            slot_down = ShmTensorSlot(f"down_L{i + 1}_to_L{i}", (1, d_repr))
+            slot_down = ShmTensorSlot(f"down_L{i + 1}_to_L{i}", (1, d_repr_upper))
             self._downward_slots.append(slot_down)
 
     def _spawn_levels(self, ctx, freqs: List[float]) -> None:

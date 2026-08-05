@@ -23,6 +23,7 @@ from precog.model.control_head import ControlHead
 from precog.model.hierarchical_clock import LevelClock
 from precog.processes.action_utils import action_from_obs, action_to_dict
 
+
 def _set_realtime(priority: int, core: Optional[int]) -> None:
     """Set SCHED_FIFO scheduling and optionally pin to a CPU core."""
     try:
@@ -42,6 +43,7 @@ def _set_realtime(priority: int, core: Optional[int]) -> None:
         print("[L0] WARNING: Cannot set SCHED_FIFO -- run with CAP_SYS_NICE or as root")
     except Exception as e:
         print(f"[L0] WARNING: Scheduling config failed: {e}")
+
 
 def _format_inputs(
     obs_dict: Dict[str, torch.Tensor],
@@ -67,12 +69,15 @@ def _format_inputs(
         parts.append(torch.zeros(batch_size, control_dim, device=device))
     return torch.cat(parts, dim=-1)
 
+
 def run_world(
     stop_event: multiprocessing.Event,
     *,
     clock: LevelClock,
     upward_writer: ShmTensorSlot,
     downward_reader: ShmTensorSlot,
+    env_config_path: str = "./src/precog/envs/ros/env_config.yaml",
+    num_levels: int = 0,
     control_repr_reader: Optional[ShmTensorSlot] = None,
     headless: bool = True,
     dashboard_port: int = 8080,
@@ -83,15 +88,18 @@ def run_world(
         _set_realtime(rt_priority, rt_core)
 
     import rclpy, yaml
+
     rclpy.init()
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     device = "cpu"
-    with open(ENV_CONFIG_PATH) as f:
+    with open(env_config_path) as f:
         env_cfg = yaml.safe_load(f)
     env_shapes = _env_shapes_from_yaml(env_cfg)
     config = resolve_config_dims(DEFAULT_CONFIG, env_shapes)
 
-    env = ROSEnvironment(config_path=ENV_CONFIG_PATH, device=device)
+    env = ROSEnvironment(config_path=env_config_path, device=device)
     action_keys = [s.key for s in env.action_specs]
 
     source_selector = SourceSelector()
@@ -107,6 +115,9 @@ def run_world(
         output_dim=ctrl_cfg.output_dim,
         output_scales=ctrl_cfg.output_scales or None,
     ).to(device)
+    control_head.train()
+
+    ctrl_optimizer = torch.optim.AdamW(control_head.parameters(), lr=1e-3)
 
     if control_head.output_scales is not None:
         action_scales = control_head.output_scales.to(device)
@@ -120,6 +131,8 @@ def run_world(
 
             dashboard = DashboardServer(port=dashboard_port)
             dashboard.start()
+            if num_levels > 0:
+                dashboard.watch_level_logs(num_levels)
         except Exception:
             pass
 
@@ -129,7 +142,7 @@ def run_world(
     tick_count = 0
     blend_steer = 0.0
     blend_acc = 0.0
-    
+
     _last_tick_time = time.monotonic()
     _hz = 0.0
     _last_gc_collect = 0
@@ -138,7 +151,6 @@ def run_world(
 
     try:
         while rclpy.ok() and not stop_event.is_set():
-
             if dashboard is not None:
                 ctrl = dashboard.controls
                 new_steer = ctrl.blend_steer_safe
@@ -166,7 +178,7 @@ def run_world(
                 )
 
             if downward_reader is not None:
-                raw = downward_reader.read(timeout_us=0)
+                raw = downward_reader.read(timeout_us=5000)
                 if raw is not None:
                     signal_down = raw.to(torch.device(device))
 
@@ -188,21 +200,32 @@ def run_world(
             if not torch.isnan(formatted_input).any():
                 upward_writer.write(formatted_input)
 
-            raw_top = downward_reader.read(timeout_us=0)
+            raw_top = downward_reader.read(timeout_us=5000)
             if raw_top is not None:
                 z_ctrl = raw_top.to(device)
                 action = control_head(z_ctrl.unsqueeze(1))[:, -1]
+
+                if expert_action is not None and (
+                    blend_steer < 0.999 or blend_acc < 0.999
+                ):
+                    blend_weight = 1.0 - (blend_steer + blend_acc) / 2.0
+                    loss_ctrl = blend_weight * torch.nn.functional.mse_loss(
+                        action, expert_action
+                    )
+                    ctrl_optimizer.zero_grad()
+                    loss_ctrl.backward()
+                    ctrl_optimizer.step()
             else:
                 action = torch.zeros(1, config.control_dim, device=device)
 
             act_dict = action_to_dict(action, action_keys)
-            
+
             obs = env.step(act_dict)
 
             tick_count += 1
-            
+
             now = time.monotonic()
-            _hz = 0.9 * _hz + 0.1 / max(now - _last_tick_time, 1e-6)
+            _hz = 0.99 * _hz + 0.01 / max(now - _last_tick_time, 1e-6)
             _last_tick_time = now
 
             if tick_count - _last_gc_collect > 20_000:
@@ -233,10 +256,10 @@ def run_world(
 
             if tick_count % 200 == 0:
                 ma = action[0].tolist()
-                print(f"[L0] tick={tick_count}  action=[{ma[0]:.4f}, {ma[1]:.4f}]")
+                print(f"[World] tick={tick_count}  action=[{ma[0]:.4f}, {ma[1]:.4f}]")
 
             clock.sleep_until_next_tick()
-    
+
     except KeyboardInterrupt:
         pass
     finally:
@@ -245,4 +268,7 @@ def run_world(
             dashboard.stop()
         source_selector.close()
         env.close()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass

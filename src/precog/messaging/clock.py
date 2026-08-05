@@ -22,7 +22,7 @@ from typing import Optional
 
 
 _HEADER_SIZE = 16  # tick_count + sim_time
-_SLOT_SIZE = 8     # one int64 per level
+_SLOT_SIZE = 8  # one int64 per level
 
 
 def _pack_int64(buf, offset: int, value: int) -> None:
@@ -44,18 +44,23 @@ def _unpack_float64(buf, offset: int) -> float:
 class ShmBeat:
     """Shared-memory monotonic tick with back-pressure barriers."""
 
-    def __init__(self, name: str, num_levels: int, *, create: bool = False,
-                 base_frequency: float = 0.0):
+    def __init__(
+        self,
+        name: str,
+        num_levels: int,
+        *,
+        create: bool = False,
+        base_frequency: float = 0.0,
+    ):
         self._num_levels = num_levels
         self._total_bytes = _HEADER_SIZE + num_levels * _SLOT_SIZE
         shm_name = f"shm_beat_{name}"
 
         if create:
-            self._shm = SharedMemory(name=shm_name, create=True,
-                                     size=self._total_bytes)
+            self._shm = SharedMemory(name=shm_name, create=True, size=self._total_bytes)
             self._buf = self._shm.buf
-            _pack_int64(self._buf, 0, 0)           # tick_count = 0
-            _pack_float64(self._buf, 8, 0.0)       # sim_time = 0.0
+            _pack_int64(self._buf, 0, 0)  # tick_count = 0
+            _pack_float64(self._buf, 8, 0.0)  # sim_time = 0.0
             for i in range(num_levels):
                 _pack_int64(self._buf, _HEADER_SIZE + i * _SLOT_SIZE, -1)
             self._base_dt = 1.0 / base_frequency if base_frequency > 0 else 0.0
@@ -130,6 +135,7 @@ class ShmBeat:
             return
         self._closed = True
         try:
+            self._buf = None
             self._shm.close()
         except Exception:
             pass
@@ -141,6 +147,8 @@ class ShmBeat:
             pass
 
     def __repr__(self) -> str:
-        return (f"ShmBeat(tick={self.tick_count}, "
-                f"sim={self.sim_time:.4f}s, "
-                f"levels={self._num_levels})")
+        return (
+            f"ShmBeat(tick={self.tick_count}, "
+            f"sim={self.sim_time:.4f}s, "
+            f"levels={self._num_levels})"
+        )

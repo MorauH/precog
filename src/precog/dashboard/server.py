@@ -98,11 +98,58 @@ class DashboardServer:
         return self._controls
 
     def update(self, data: dict[str, Any]):
-        """Store a diagnostics snapshot. Clients poll it from the WS loop."""
+        """Merge a diagnostics snapshot. Clients poll it from the WS loop."""
         data["ts"] = time.monotonic()
         with self._data_lock:
-            self._latest = data
+            self._latest.update(data)
             self._latest_seq += 1
+
+    def watch_level_logs(self, num_levels: int, poll_interval_s: float = 0.5):
+        """Spawn a background thread that polls LevelLog shm slots.
+
+        Merges each level's diagnostics into the dashboard update dict
+        under keys like ``level_0_surprise``, ``level_1_idle_time_us``, etc.
+
+        Args:
+            num_levels: Number of level log slots to watch (0 .. num_levels-1).
+            poll_interval_s: Polling interval in seconds (default 0.5).
+        """
+        if not self._running:
+            return
+
+        def _poller():
+            from precog.messaging import LevelLog
+
+            logs: list[Optional[LevelLog]] = [None] * num_levels
+
+            while self._running:
+                merged: dict[str, Any] = {}
+                for i in range(num_levels):
+                    log = logs[i]
+                    if log is None:
+                        try:
+                            log = LevelLog.attach(i)
+                            logs[i] = log
+                        except FileNotFoundError:
+                            continue
+                    snap = log.read()
+                    if snap is None:
+                        continue
+                    lid = int(snap["level_idx"])
+                    for key, val in snap.items():
+                        if key == "level_idx":
+                            continue
+                        merged[f"level_{lid}_{key}"] = val
+                if merged:
+                    self.update(merged)
+                time.sleep(poll_interval_s)
+
+            for log in logs:
+                if log is not None:
+                    log.close()
+
+        t = threading.Thread(target=_poller, daemon=True)
+        t.start()
 
     def start(self):
         """Start the web server in a daemon thread."""

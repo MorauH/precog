@@ -68,14 +68,16 @@ class ShmTensorSlot:
 
         shm_name = f"shm_slot_{name}"
         self._shm = SharedMemory(name=shm_name, create=True, size=self._total_bytes)
-        self._gen_view = self._shm.buf[_GEN_OFFSET:_GEN_OFFSET + _GEN_BYTES]
+        self._gen_view = self._shm.buf[_GEN_OFFSET : _GEN_OFFSET + _GEN_BYTES]
 
         self._name = name
         self._shm_name = shm_name
         self._closed = False
 
     @classmethod
-    def attach(cls, name: str, shape: tuple[int, ...], dtype: np.dtype = np.float32) -> "ShmTensorSlot":
+    def attach(
+        cls, name: str, shape: tuple[int, ...], dtype: np.dtype = np.float32
+    ) -> "ShmTensorSlot":
         """Attach to an existing ShmTensorSlot from another process."""
         d = np.dtype(dtype)
         payload_bytes = int(np.prod(shape)) * d.itemsize
@@ -87,7 +89,7 @@ class ShmTensorSlot:
         slot._payload_bytes = payload_bytes
         slot._total_bytes = total_bytes
         slot._shm = SharedMemory(name=f"shm_slot_{name}")
-        slot._gen_view = slot._shm.buf[_GEN_OFFSET:_GEN_OFFSET + _GEN_BYTES]
+        slot._gen_view = slot._shm.buf[_GEN_OFFSET : _GEN_OFFSET + _GEN_BYTES]
         slot._name = name
         slot._shm_name = f"shm_slot_{name}"
         slot._closed = False
@@ -112,8 +114,9 @@ class ShmTensorSlot:
         """Write a tensor to the slot. Blocks briefly during seqlock window."""
         tensor = tensor.detach().cpu().contiguous()
         arr = np.ndarray(
-            self._shape, dtype=self._dtype,
-            buffer=self._shm.buf[_GEN_BYTES:_GEN_BYTES + self._payload_bytes]
+            self._shape,
+            dtype=self._dtype,
+            buffer=self._shm.buf[_GEN_BYTES : _GEN_BYTES + self._payload_bytes],
         )
 
         for _ in range(_WRITER_RETRY_COUNT):
@@ -132,8 +135,9 @@ class ShmTensorSlot:
             Tensor copy from shared memory, or None if timeout.
         """
         arr = np.ndarray(
-            self._shape, dtype=self._dtype,
-            buffer=self._shm.buf[_GEN_BYTES:_GEN_BYTES + self._payload_bytes]
+            self._shape,
+            dtype=self._dtype,
+            buffer=self._shm.buf[_GEN_BYTES : _GEN_BYTES + self._payload_bytes],
         )
         deadline = _time_us() + timeout_us
 
@@ -162,6 +166,7 @@ class ShmTensorSlot:
             return
         self._closed = True
         try:
+            self._gen_view = None
             self._shm.close()
             self._shm.unlink()
         except Exception:

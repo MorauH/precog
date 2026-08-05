@@ -118,7 +118,7 @@ class PCLevel(nn.Module):
 
     def forward(
         self,
-        signal_seq: torch.Tensor,
+        signal_below_seq: torch.Tensor,
         h0: Optional[torch.Tensor] = None,
         signal_above_seq: Optional[torch.Tensor] = None,
         z_t_pred_init: Optional[torch.Tensor] = None,
@@ -127,8 +127,8 @@ class PCLevel(nn.Module):
         Processes a sequence of timesteps (Batch / Sequence Mode).
         Inputs shape: (Batch, Seq_Len, Dim)
         """
-        batch_size, seq_len, _ = signal_seq.shape
-        device = signal_seq.device
+        batch_size, seq_len, _ = signal_below_seq.shape
+        device = signal_below_seq.device
 
         h = h0 if h0 is not None else self.init_hidden(batch_size, device)
         z_t_pred = z_t_pred_init
@@ -136,7 +136,7 @@ class PCLevel(nn.Module):
         z_list, z_next_pred_list, z_delta_list, x_list = [], [], [], []
 
         for t in range(seq_len):
-            sig_below_t = signal_seq[:, t]
+            sig_below_t = signal_below_seq[:, t]
             sig_above_t = signal_above_seq[:, t] if signal_above_seq is not None else None
 
             out = self.step(

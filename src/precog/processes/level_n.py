@@ -23,10 +23,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from precog.messaging import ShmTensorSlot
+from precog.messaging import LevelLog, ShmTensorSlot
 from precog.model import LevelClock, PCLevel
 from precog.model.config import PCLevelConfig
-
+from precog.model.sigreg import SIGReg
 
 
 def run_level_n(
@@ -80,10 +80,12 @@ def run_level_n(
     level.train()
 
     optimizer = torch.optim.AdamW(level.parameters(), lr=lr, weight_decay=1e-4)
-    
-    loss_translate_weight = config.objective_ae_weight if config.objective_enabled else 0.0
+
+    loss_translate_weight = (
+        config.objective_ae_weight if config.objective_enabled else 0.0
+    )
     loss_task_weight = config.objective_task_weight if config.objective_enabled else 0.0
-    
+
     sigreg_loss_fn = SIGReg(
         d_repr=config.d_representation,
         online_tau=config.sigreg_tau,
@@ -93,11 +95,16 @@ def run_level_n(
     batch_size = 1
     h_state = level.init_hidden(batch_size, dev)
     prev_z_pred: Optional[torch.Tensor] = None
-    last_signal_above: Optional[torch.Tensor] = None # Hold value as this updates slower
-    task_actual: Optional[torch.Tensor] = None # Hold value as this updates slower
+    last_signal_above: Optional[torch.Tensor] = (
+        None  # Hold value as this updates slower
+    )
+    task_actual: Optional[torch.Tensor] = None  # Hold value as this updates slower
 
     accumulated_below: List[torch.Tensor] = []
     accumulated_above: List[torch.Tensor] = []
+
+    level_log = LevelLog(level_idx)
+    _idle_start = time.perf_counter()
 
     print(
         f"[L{level_idx}] Started Online Learning on {device}, "
@@ -106,10 +113,12 @@ def run_level_n(
     )
 
     while not stop_event.is_set():
+        # TODO: clock.wait_tick()
+
         #  ----- Read bottom up signal
         signal_below: Optional[torch.Tensor] = None
         if upward_reader is not None:
-            raw_below = upward_reader.read(timeout_us=10000)
+            raw_below = upward_reader.read(timeout_us=5000)
             if raw_below is not None:
                 signal_below = raw_below.to(dev)
 
@@ -126,7 +135,8 @@ def run_level_n(
                 task_actual = raw_task.to(dev)
 
         if signal_below is None:
-            time.sleep(0.0001)
+            clock.mark_done()
+            time.sleep(0.01)
             continue
 
         if d_above is not None:
@@ -147,18 +157,9 @@ def run_level_n(
             accumulated_below = [signal_below]
             accumulated_above = [cur_above] if cur_above is not None else []
 
-        clock.wait_tick()
-
-        if not clock.should_update() or not accumulated_below:
-            continue
-
         # ----- Format sequence tensors
         seq_below = torch.stack(accumulated_below, dim=1)
-        seq_above = (
-            torch.stack(accumulated_above, dim=1)
-            if accumulated_above
-            else None
-        )
+        seq_above = torch.stack(accumulated_above, dim=1) if accumulated_above else None
 
         task_target = None
         x_actual = None
@@ -173,10 +174,10 @@ def run_level_n(
         if seq_below.shape[1] == 1:
             # Single step
             out: PCLevelOutput = level.step(
-                signal_below = seq_below[:, 0],
-                h_prev = h_in,
-                signal_above = seq_above[:, 0] if seq_above is not None else None,
-                z_t_pred = prev_z_pred,
+                signal_below=seq_below[:, 0],
+                h_prev=h_in,
+                signal_above=seq_above[:, 0] if seq_above is not None else None,
+                z_t_pred=prev_z_pred,
             )
             z_t = out.z_t
             z_next_pred = out.z_next_pred
@@ -186,18 +187,18 @@ def run_level_n(
             # Prediction loss
             loss_pred = torch.tensor(0.0, device=dev)
             if prev_z_pred is not None:
-                loss_z_pred = F.mse_loss(prev_z_pred, z_t.detach())
+                loss_pred = F.mse_loss(prev_z_pred, z_t.detach())
 
         else:
             # Multi-step sequence mode
             out: PCLevelOutput = level.forward(
-                signal_below = seq_below,
-                h_0 = h_in,
-                signal_above = seq_above,
-                z_t_pred = prev_z_pred,
+                signal_seq=seq_below,
+                h0=h_in,
+                signal_above_seq=seq_above,
+                z_t_pred_init=prev_z_pred,
             )
-            z_t_seq = out.z_t                 # (1, T, d_repr)
-            z_next_pred_seq = out.z_next_pred # (1, T, d_repr)
+            z_t_seq = out.z_t  # (1, T, d_repr)
+            z_next_pred_seq = out.z_next_pred  # (1, T, d_repr)
 
             z_t = z_t_seq[:, -1]
             z_next_pred = z_next_pred_seq[:, -1]
@@ -216,7 +217,7 @@ def run_level_n(
                 loss_pred = loss_pred + F.mse_loss(prev_z_pred, z_t_seq[:, 0].detach())
 
         # ----- Loss calc
- 
+
         with torch.no_grad():
             sigreg_loss_fn.update_online(z_t.detach())
         loss_sigreg = sigreg_loss_fn.compute_loss_online()
@@ -224,12 +225,22 @@ def run_level_n(
         # Optional task loss
         loss_task = torch.tensor(0.0, device=dev)
         loss_translate = torch.tensor(0.0, device=dev)
-        
-        if config.objective_enabled and x_pred is not None and task_target is not None and task_actual is not None:
-                loss_task = F.mse_loss(x_pred, task_target)
-                loss_translate = F.mse_loss(x_pred, task_actual)
-            
-        total_loss = loss_pred + loss_sigreg + (loss_task_weight * loss_task) + (loss_translate_weight * loss_translate)
+
+        if (
+            config.objective_enabled
+            and x_pred is not None
+            and task_target is not None
+            and task_actual is not None
+        ):
+            loss_task = F.mse_loss(x_pred, task_target)
+            loss_translate = F.mse_loss(x_pred, task_actual)
+
+        total_loss = (
+            loss_pred
+            + loss_sigreg
+            + (loss_task_weight * loss_task)
+            + (loss_translate_weight * loss_translate)
+        )
 
         # ----- Backward and optimize
         if total_loss.requires_grad:
@@ -251,8 +262,34 @@ def run_level_n(
         accumulated_below.clear()
         accumulated_above.clear()
 
+        # ----- Diagnostics
+        _now = time.perf_counter()
+        idle_us = (_now - _idle_start) * 1_000_000
+        _idle_start = _now
+        with torch.no_grad():
+            surprise = (
+                F.mse_loss(prev_z_pred, z_t).item()
+                if prev_z_pred is not None and z_t is not None
+                else 0.0
+            )
+        level_log.write(
+            tick_count=clock.tick_count,
+            sim_time=clock.sim_time,
+            idle_time_us=idle_us,
+            surprise=surprise,
+            loss_pred=loss_pred.item(),
+            loss_sigreg=loss_sigreg.item(),
+            loss_task=loss_task.item()
+            if isinstance(loss_task, torch.Tensor)
+            else loss_task,
+            loss_translate=loss_translate.item()
+            if isinstance(loss_translate, torch.Tensor)
+            else loss_translate,
+            loss_total=total_loss.item(),
+        )
+
         clock.mark_done()
 
-        clock.sleep_until_next_tick()
-
+    level_log.close()
+    level_log.unlink()
     print(f"[L{level_idx}] Shutting down")

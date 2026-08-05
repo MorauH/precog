@@ -5,22 +5,25 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>precog dashboard</title>
 <style>
-:root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149; --yellow: #d2991d; }
+:root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149; --yellow: #d2991d; --purple: #bc8cff; --cyan: #56d4dd; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
 h1 { font-size: 20px; margin-bottom: 16px; color: var(--accent); }
+h2 { font-size: 15px; margin-bottom: 10px; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 16px; margin-bottom: 16px; }
 .row { display: flex; gap: 16px; flex-wrap: wrap; }
 .col { flex: 1; min-width: 280px; }
 .label { font-size: 11px; text-transform: uppercase; color: var(--dim); letter-spacing: 0.5px; margin-bottom: 4px; }
 .value { font-size: 20px; font-weight: 600; }
 .mono { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 14px; }
+.small-mono { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 12px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
 input[type=range] { width: 100%; accent-color: var(--accent); }
 button { background: var(--border); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
 button:hover { border-color: var(--accent); }
 button.active { background: var(--accent); color: #000; }
-canvas { width: 100%; height: 240px; }
+canvas { width: 100%; height: 200px; }
+canvas.tall { height: 240px; }
 #status { margin-top: 8px; color: var(--green); font-size: 13px; }
 #status.disconnected { color: var(--red); }
 .stale { color: var(--yellow); }
@@ -63,11 +66,6 @@ canvas { width: 100%; height: 240px; }
 </div>
 
 <div class="card">
-  <div class="label">Surprise</div>
-  <canvas id="chart_surprise"></canvas>
-</div>
-
-<div class="card">
   <div class="label">Metrics</div>
   <div class="grid">
     <div><div class="label">Tick rate</div><div class="value mono" id="m_hz">--</div></div>
@@ -91,26 +89,128 @@ canvas { width: 100%; height: 240px; }
   </div>
 </div>
 
+<div class="row">
+  <div class="col">
+    <div class="card">
+      <div class="label">Surprise</div>
+      <canvas id="chart_surprise" class="tall"></canvas>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <div class="label">Prediction Loss</div>
+      <canvas id="chart_loss_pred" class="tall"></canvas>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col">
+    <div class="card">
+      <div class="label">SIGReg Loss</div>
+      <canvas id="chart_loss_sigreg" class="tall"></canvas>
+    </div>
+  </div>
+  <div class="col">
+    <div class="card">
+      <div class="label">Total Loss</div>
+      <canvas id="chart_loss_total" class="tall"></canvas>
+    </div>
+  </div>
+</div>
+
+  <div class="card">
+    <div class="label">Idle Time</div>
+    <canvas id="chart_idle" class="tall"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="label">Level Diagnostics</div>
+    <div class="grid" id="level_value_grid"><div class="label">No level data yet</div></div>
+  </div>
+
+  <div class="card" id="level_metrics_card">
+    <h2>Per-Level Diagnostics</h2>
+    <div class="grid" id="level_metrics_grid"></div>
+  </div>
+
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script>
 const MAX_POINTS = 300;
+const LEVEL_COLORS = ['#58a6ff', '#d2991d', '#3fb950', '#bc8cff', '#f85149', '#56d4dd'];
 
-function makeChartData(ds1Label, ds1Color, ds2Label, ds2Color) {
-  return { labels: [], datasets: [
-    { label: ds1Label, borderColor: ds1Color, data: [], tension: 0.1, pointRadius: 0 },
-    { label: ds2Label, borderColor: ds2Color, data: [], tension: 0.1, pointRadius: 0, borderDash: [4, 2] },
-  ]};
+function makeLevelChartData(numLevels, labelPrefix) {
+  const datasets = [];
+  for (let i = 0; i < numLevels; i++) {
+    datasets.push({
+      label: 'L' + i,
+      borderColor: LEVEL_COLORS[i % LEVEL_COLORS.length],
+      data: [],
+      tension: 0.1,
+      pointRadius: 0,
+    });
+  }
+  return { labels: [], datasets };
 }
 
-const steerData = makeChartData('model', '#58a6ff', 'expert', '#8b949e');
-const accData   = makeChartData('model', '#3fb950', 'expert', '#6e7681');
-const surpriseData = { labels: [], datasets: [
-  { label: 'L0', borderColor: '#58a6ff', data: [], tension: 0.1, pointRadius: 0 },
-  { label: 'L1', borderColor: '#d2991d', data: [], tension: 0.1, pointRadius: 0 },
+const steerData = { labels: [], datasets: [
+  { label: 'model', borderColor: '#58a6ff', data: [], tension: 0.1, pointRadius: 0 },
+  { label: 'expert', borderColor: '#8b949e', data: [], tension: 0.1, pointRadius: 0, borderDash: [4, 2] },
+]};
+const accData = { labels: [], datasets: [
+  { label: 'model', borderColor: '#3fb950', data: [], tension: 0.1, pointRadius: 0 },
+  { label: 'expert', borderColor: '#6e7681', data: [], tension: 0.1, pointRadius: 0, borderDash: [4, 2] },
 ]};
 
+  let numLevels = 0;
+  let _levelGridBuilt = false;
+let surpriseData = makeLevelChartData(0, 'Surprise');
+let lossPredData = makeLevelChartData(0, 'Loss Pred');
+let lossSigregData = makeLevelChartData(0, 'Loss SIGReg');
+let lossTotalData = makeLevelChartData(0, 'Loss Total');
+let idleTimeData = makeLevelChartData(0, 'Idle');
+
+let chartSurprise, chartLossPred, chartLossSigreg, chartLossTotal, chartIdle;
+
+function rebuildLevelCharts() {
+  surpriseData = makeLevelChartData(numLevels, 'Surprise');
+  lossPredData = makeLevelChartData(numLevels, 'Loss Pred');
+  lossSigregData = makeLevelChartData(numLevels, 'Loss SIGReg');
+  lossTotalData = makeLevelChartData(numLevels, 'Loss Total');
+  idleTimeData = makeLevelChartData(numLevels, 'Idle');
+
+  chartSurprise = makeChart('chart_surprise', surpriseData, 'Surprise');
+  chartLossPred = makeChart('chart_loss_pred', lossPredData, 'Loss Pred');
+  chartLossSigreg = makeChart('chart_loss_sigreg', lossSigregData, 'Loss SIGReg');
+  chartLossTotal = makeChart('chart_loss_total', lossTotalData, 'Loss Total');
+  chartIdle = makeChart('chart_idle', idleTimeData, 'Idle time (us)');
+}
+
+function detectLevels(d) {
+  const seen = new Set();
+  for (const key of Object.keys(d)) {
+    const m = key.match(/^level_(\d+)_/);
+    if (m) seen.add(parseInt(m[1]));
+  }
+  return Math.max(0, ...seen) + 1;
+}
+
+function fmt(v) {
+  if (v === null || v === undefined || v === '--') return '--';
+  if (typeof v === 'number') return v.toFixed(4);
+  return String(v);
+}
+
+function fmtInt(v) {
+  if (v === null || v === undefined || v === '--') return '--';
+  if (typeof v === 'number') return Math.round(v).toString();
+  return String(v);
+}
+
 function makeChart(id, data, yLabel) {
-  const ctx = document.getElementById(id).getContext('2d');
+  const el = document.getElementById(id);
+  if (!el) return null;
+  const ctx = el.getContext('2d');
   return new Chart(ctx, {
     type: 'line', data,
     options: {
@@ -123,7 +223,6 @@ function makeChart(id, data, yLabel) {
 
 let chartSteer = makeChart('chart_steer', steerData, 'Steer');
 let chartAcc = makeChart('chart_acc', accData, 'Acc');
-let chartSurprise = makeChart('chart_surprise', surpriseData, 'Surprise');
 
 const statusEl = document.getElementById('status');
 const blendSteerSlider = document.getElementById('blend_steer');
@@ -171,10 +270,12 @@ function connect() {
   };
 }
 
-function pushData(chart, dataArr, ds0, ds1) {
+function pushDataMulti(chart, dataArr, values) {
+  if (!chart) return;
   dataArr.labels.push(dataArr.labels.length);
-  dataArr.datasets[0].data.push(ds0);
-  dataArr.datasets[1].data.push(ds1);
+  for (let i = 0; i < dataArr.datasets.length; i++) {
+    dataArr.datasets[i].data.push(values[i] !== undefined ? values[i] : null);
+  }
   while (dataArr.labels.length > MAX_POINTS) {
     dataArr.labels.shift();
     dataArr.datasets.forEach(d => d.data.shift());
@@ -182,9 +283,66 @@ function pushData(chart, dataArr, ds0, ds1) {
   chart.update();
 }
 
+function updateLevelMetricsGrid(d) {
+  const grid = document.getElementById('level_metrics_grid');
+  if (!grid) return;
+  const levels = detectLevels(d);
+  let html = '';
+  for (let i = 0; i < levels; i++) {
+    const s = d['level_' + i + '_surprise'];
+    const lp = d['level_' + i + '_loss_pred'];
+    const ls = d['level_' + i + '_loss_sigreg'];
+    const lt = d['level_' + i + '_loss_task'];
+    const ltr = d['level_' + i + '_loss_translate'];
+    const ltot = d['level_' + i + '_loss_total'];
+    const idle = d['level_' + i + '_idle_time_us'];
+    const tc = d['level_' + i + '_tick_count'];
+    const st = d['level_' + i + '_sim_time'];
+    const color = LEVEL_COLORS[i % LEVEL_COLORS.length];
+    html += '<div style="border-left: 3px solid ' + color + '; padding-left: 8px;">';
+    html += '<div class="label" style="color:' + color + '">Level ' + i + '</div>';
+    html += '<div class="small-mono"><span class="label">tick</span> ' + fmtInt(tc) + '</div>';
+    html += '<div class="small-mono"><span class="label">sim</span> ' + fmt(st) + 's</div>';
+    html += '<div class="small-mono"><span class="label">idle</span> ' + fmtInt(idle) + ' us</div>';
+    html += '<div class="small-mono"><span class="label">surprise</span> ' + fmt(s) + '</div>';
+    html += '<div class="small-mono"><span class="label">loss_pred</span> ' + fmt(lp) + '</div>';
+    html += '<div class="small-mono"><span class="label">loss_sigreg</span> ' + fmt(ls) + '</div>';
+    html += '<div class="small-mono"><span class="label">loss_task</span> ' + fmt(lt) + '</div>';
+    html += '<div class="small-mono"><span class="label">loss_translate</span> ' + fmt(ltr) + '</div>';
+    html += '<div class="small-mono"><span class="label">loss_total</span> <strong>' + fmt(ltot) + '</strong></div>';
+    html += '</div>';
+  }
+  grid.innerHTML = html;
+}
+
 function updateUI(d) {
   msgCount += 1;
   document.getElementById('m_msg').textContent = msgCount;
+
+  const newNumLevels = detectLevels(d);
+  if (newNumLevels !== numLevels) {
+    numLevels = newNumLevels;
+    rebuildLevelCharts();
+    _levelGridBuilt = false;
+  }
+  if (numLevels > 0 && !_levelGridBuilt) {
+    _levelGridBuilt = true;
+    const grid = document.getElementById('level_value_grid');
+    if (grid) {
+      let html = '';
+      for (let i = 0; i < numLevels; i++) {
+        const c = LEVEL_COLORS[i % LEVEL_COLORS.length];
+        html += '<div style="border-left:3px solid ' + c + ';padding-left:10px">';
+        html += '<div class="label" style="color:' + c + '">Level ' + i + '</div>';
+        html += '<div><span class="label">idle</span> <span class="value mono" id="lv_idle_' + i + '">--</span> <span style="font-size:12px;color:var(--dim)">us</span></div>';
+        html += '<div><span class="label">sigreg</span> <span class="value mono" id="lv_sigreg_' + i + '">--</span></div>';
+        html += '<div><span class="label">surprise</span> <span class="value mono" id="lv_surprise_' + i + '">--</span></div>';
+        html += '</div>';
+      }
+      grid.innerHTML = html;
+    }
+  }
+
   if (d.blend_ratio_steer !== undefined) {
     const pct = Math.round(d.blend_ratio_steer * 100);
     blendSteerSlider.value = pct;
@@ -222,24 +380,41 @@ function updateUI(d) {
   if (d.action !== undefined && d.expert_action !== undefined) {
     const [ms, ma] = vals(d.action);
     const [es, ea] = vals(d.expert_action);
-    pushData(chartSteer, steerData, ms, es);
-    pushData(chartAcc, accData, ma, ea);
+    pushDataMulti(chartSteer, steerData, [ms, es]);
+    pushDataMulti(chartAcc, accData, [ma, ea]);
   }
 
-  if (d.surprise !== undefined) {
-    surpriseData.labels.push(surpriseData.labels.length);
-    const s = d.surprise;
-    surpriseData.datasets[0].data.push(s[0] !== undefined ? s[0] : null);
-    surpriseData.datasets[1].data.push(s[1] !== undefined ? s[1] : null);
-    while (surpriseData.labels.length > MAX_POINTS) {
-      surpriseData.labels.shift();
-      surpriseData.datasets.forEach(d => d.data.shift());
-    }
-    chartSurprise.update();
+  if (numLevels > 0) {
+    const sv = []; for (let i = 0; i < numLevels; i++) sv.push(d['level_' + i + '_surprise']);
+    const lp = []; for (let i = 0; i < numLevels; i++) lp.push(d['level_' + i + '_loss_pred']);
+    const ls = []; for (let i = 0; i < numLevels; i++) ls.push(d['level_' + i + '_loss_sigreg']);
+    const lt = []; for (let i = 0; i < numLevels; i++) lt.push(d['level_' + i + '_loss_total']);
+    const id = []; for (let i = 0; i < numLevels; i++) id.push(d['level_' + i + '_idle_time_us']);
+
+    if (sv.some(v => v !== undefined)) pushDataMulti(chartSurprise, surpriseData, sv);
+    if (lp.some(v => v !== undefined)) pushDataMulti(chartLossPred, lossPredData, lp);
+    if (ls.some(v => v !== undefined)) pushDataMulti(chartLossSigreg, lossSigregData, ls);
+    if (lt.some(v => v !== undefined)) pushDataMulti(chartLossTotal, lossTotalData, lt);
+    if (id.some(v => v !== undefined)) pushDataMulti(chartIdle, idleTimeData, id);
+
+    updateLevelMetricsGrid(d);
+    updateLevelValues(d, numLevels);
   }
 }
 
-connect();
+function updateLevelValues(d, n) {
+    for (let i = 0; i < n; i++) {
+      const el = function(id) { const e = document.getElementById(id); return e; };
+      const idle = d['level_' + i + '_idle_time_us'];
+      const sigreg = d['level_' + i + '_loss_sigreg'];
+      const surprise = d['level_' + i + '_surprise'];
+      if (el('lv_idle_' + i)) el('lv_idle_' + i).textContent = fmtInt(idle);
+      if (el('lv_sigreg_' + i)) el('lv_sigreg_' + i).textContent = fmt(sigreg);
+      if (el('lv_surprise_' + i)) el('lv_surprise_' + i).textContent = fmt(surprise);
+    }
+  }
+
+  connect();
 </script>
 </body>
 </html>

@@ -42,20 +42,29 @@ def _worker_world(
     downward_reader_proxy,
     rt_priority,
     rt_core,
+    env_config_path="",
 ):
     """Wrapper that catches exceptions in the world worker."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
     from precog.processes.world import run_world
     from precog.messaging.clock import ShmBeat
     from precog.model.hierarchical_clock import LevelClock
 
-    beat = ShmBeat(beat_name, num_levels, create=False,
-                   base_frequency=base_frequency)
+    beat = ShmBeat(beat_name, num_levels, create=False, base_frequency=base_frequency)
     clock = LevelClock.writer(beat)
 
-    upward_writer = (_ShmWriterHandle(*upward_writer_proxy).writer()
-                     if upward_writer_proxy is not None else None)
-    downward_reader = (_ShmReaderHandle(*downward_reader_proxy).reader()
-                       if downward_reader_proxy is not None else None)
+    upward_writer = (
+        _ShmWriterHandle(*upward_writer_proxy).writer()
+        if upward_writer_proxy is not None
+        else None
+    )
+    downward_reader = (
+        _ShmReaderHandle(*downward_reader_proxy).reader()
+        if downward_reader_proxy is not None
+        else None
+    )
 
     try:
         run_world(
@@ -63,6 +72,8 @@ def _worker_world(
             clock=clock,
             upward_writer=upward_writer,
             downward_reader=downward_reader,
+            env_config_path=env_config_path,
+            num_levels=num_levels,
             headless=headless,
             dashboard_port=dashboard_port,
             rt_priority=rt_priority,
@@ -73,6 +84,13 @@ def _worker_world(
         import traceback
 
         traceback.print_exc()
+    finally:
+        if upward_writer is not None:
+            upward_writer.close()
+        if downward_reader is not None:
+            downward_reader.close()
+        beat.close()
+
 
 def _worker_level_n(
     stop_event,
@@ -91,13 +109,15 @@ def _worker_level_n(
     device,
 ):
     """Wrapper that catches exceptions in an level worker."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
     from precog.processes.level_n import run_level_n
     from precog.model.config import PCLevelConfig, SSMConfig
     from precog.messaging.clock import ShmBeat
     from precog.model.hierarchical_clock import LevelClock
 
-    beat = ShmBeat(beat_name, num_levels, create=False,
-                   base_frequency=base_frequency)
+    beat = ShmBeat(beat_name, num_levels, create=False, base_frequency=base_frequency)
     divisor = round(base_frequency / frequency)
     clock = LevelClock.reader(beat, divisor=divisor, level_idx=level_idx)
 
@@ -118,14 +138,23 @@ def _worker_level_n(
         "obj_target": cfg.objective_target_value,
     }
 
+    _slots: list[ShmTensorSlot] = []
     if upward_reader is not None:
-        kwargs["upward_reader"] = _ShmReaderHandle(*upward_reader).reader()
+        s = _ShmReaderHandle(*upward_reader).reader()
+        kwargs["upward_reader"] = s
+        _slots.append(s)
     if upward_writer is not None:
-        kwargs["upward_writer"] = _ShmWriterHandle(*upward_writer).writer()
+        s = _ShmWriterHandle(*upward_writer).writer()
+        kwargs["upward_writer"] = s
+        _slots.append(s)
     if downward_reader is not None:
-        kwargs["downward_reader"] = _ShmReaderHandle(*downward_reader).reader()
+        s = _ShmReaderHandle(*downward_reader).reader()
+        kwargs["downward_reader"] = s
+        _slots.append(s)
     if downward_writer is not None:
-        kwargs["downward_writer"] = _ShmWriterHandle(*downward_writer).writer()
+        s = _ShmWriterHandle(*downward_writer).writer()
+        kwargs["downward_writer"] = s
+        _slots.append(s)
 
     try:
         run_level_n(**kwargs)
@@ -134,6 +163,10 @@ def _worker_level_n(
         import traceback
 
         traceback.print_exc()
+    finally:
+        for s in _slots:
+            s.close()
+        beat.close()
 
 
 class _ShmReaderHandle:
@@ -168,7 +201,7 @@ class Launcher:
         num_levels: int = 2,
         *,
         device: Optional[str] = None,
-        headless: bool = True,
+        headless: bool = False,
         dashboard_port: int = 8080,
         level_frequencies: Optional[List[float]] = None,
         rt_priority: int = 0,
@@ -188,6 +221,7 @@ class Launcher:
         self._world_process: Optional[multiprocessing.Process] = None
         self._level_processes: List[multiprocessing.Process] = []
         self._level_kwargs: List[Dict[str, Any]] = []
+        self._shutting_down = False
 
         self._upward_slots: List[ShmTensorSlot] = []
         self._downward_slots: List[ShmTensorSlot] = []
@@ -215,8 +249,9 @@ class Launcher:
 
         self._create_channels(ctx)
         base_freq = max(freqs)
-        self._beat = ShmBeat("main", self._num_levels, create=True,
-                             base_frequency=base_freq)
+        self._beat = ShmBeat(
+            "main", self._num_levels, create=True, base_frequency=base_freq
+        )
         self._spawn_world(ctx, base_freq)
         self._spawn_levels(ctx, freqs)
 
@@ -226,6 +261,15 @@ class Launcher:
         """Create all inter-process communication channels."""
         config = self._config
 
+        # Slot 0: world ↔ L0 (sized by raw input dim, and L0's repr dim)
+        up0 = ShmTensorSlot("up_world_to_L0", (1, config.d_input))
+        self._upward_slots.append(up0)
+        down0 = ShmTensorSlot(
+            "down_L0_to_world", (1, config.level_configs[0].d_representation)
+        )
+        self._downward_slots.append(down0)
+
+        # Slots 1..n-1: between PCLevels
         for i in range(self._num_levels - 1):
             lvl_cfg = config.level_configs[i]
             d_repr = lvl_cfg.d_representation
@@ -242,54 +286,48 @@ class Launcher:
         for i in range(0, self._num_levels):
             lvl_cfg = config.level_configs[i]
 
-            d_below = config.level_configs[i - 1].d_representation if i != 0 else None
+            d_below = (
+                config.d_input
+                if i == 0
+                else config.level_configs[i - 1].d_representation
+            )
             d_above = (
                 config.level_configs[i + 1].d_representation
                 if i + 1 < self._num_levels
                 else None
             )
 
-            upward_reader = None
-            upward_writer = None
-            downward_reader = None
-            downward_writer = None
+            upward_reader = (
+                self._upward_slots[i].name,
+                self._upward_slots[i].shape,
+                str(self._upward_slots[i]._dtype),
+            )
 
-            if i > 0:
-                slot_idx = i - 1
-                upward_reader = (
-                    self._upward_slots[slot_idx].name,
-                    self._upward_slots[slot_idx].shape,
-                    str(self._upward_slots[slot_idx]._dtype),
+            upward_writer = (
+                (
+                    self._upward_slots[i + 1].name,
+                    self._upward_slots[i + 1].shape,
+                    str(self._upward_slots[i + 1]._dtype),
                 )
+                if i + 1 < self._num_levels
+                else None
+            )
 
-            if i + 1 < self._num_levels:
-                slot_idx = i
-                upward_writer = (
-                    self._upward_slots[slot_idx].name,
-                    self._upward_slots[slot_idx].shape,
-                    str(self._upward_slots[slot_idx]._dtype),
+            downward_reader = (
+                (
+                    self._downward_slots[i + 1].name,
+                    self._downward_slots[i + 1].shape,
+                    str(self._downward_slots[i + 1]._dtype),
                 )
+                if i + 1 < self._num_levels
+                else None
+            )
 
-            if i + 1 < self._num_levels:
-                slot_idx = i
-                downward_reader = (
-                    self._downward_slots[slot_idx].name,
-                    self._downward_slots[slot_idx].shape,
-                    str(self._downward_slots[slot_idx]._dtype),
-                )
-
-            if i == 0:
-                slot_idx = 0
-            else:
-                slot_idx = i - 1
-
-            if i < self._num_levels:
-                if slot_idx < len(self._downward_slots):
-                    downward_writer = (
-                        self._downward_slots[slot_idx].name,
-                        self._downward_slots[slot_idx].shape,
-                        str(self._downward_slots[slot_idx]._dtype),
-                    )
+            downward_writer = (
+                self._downward_slots[i].name,
+                self._downward_slots[i].shape,
+                str(self._downward_slots[i]._dtype),
+            )
 
             cfg_dict = {
                 "d_representation": lvl_cfg.d_representation,
@@ -370,6 +408,7 @@ class Launcher:
             "downward_reader_proxy": downward_reader_proxy,
             "rt_priority": self._rt_priority,
             "rt_core": self._rt_core,
+            "env_config_path": ENV_CONFIG_PATH,
         }
 
         self._world_process = ctx.Process(
@@ -392,7 +431,13 @@ class Launcher:
 
         try:
             while True:
-                if self._world_process is not None and not self._world_process.is_alive():
+                if self._shutting_down:
+                    break
+
+                if (
+                    self._world_process is not None
+                    and not self._world_process.is_alive()
+                ):
                     print("[Launcher] World process exited, shutting down")
                     self.shutdown()
                     break
@@ -431,6 +476,10 @@ class Launcher:
 
     def shutdown(self) -> None:
         """Stop all child processes gracefully."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
         if self._stop_event is not None:
             self._stop_event.set()
 
@@ -441,6 +490,9 @@ class Launcher:
                 if proc.is_alive():
                     proc.terminate()
                     proc.join(timeout=2.0)
+                if proc.is_alive() and proc.pid is not None:
+                    os.kill(proc.pid, signal.SIGKILL)
+                    proc.join(timeout=1.0)
 
         for slot in self._upward_slots:
             slot.close()
@@ -448,6 +500,7 @@ class Launcher:
             slot.close()
 
         if hasattr(self, "_beat"):
+            self._beat.close()
             self._beat.unlink()
 
         print("[Launcher] All processes stopped")

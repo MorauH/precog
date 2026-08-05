@@ -127,8 +127,9 @@ def _worker_level_n(
     from precog.processes.level_n import run_level_n
     from precog.model.config import PCLevelConfig, SSMConfig
 
-    ssm_dict = config_dict.get("ssm", {})
-    cfg = PCLevelConfig(ssm=SSMConfig(**ssm_dict), **config_dict)
+    cfg_dict_clean = config_dict.copy()
+    ssm_dict = cfg_dict_clean.pop("ssm", {})
+    cfg = PCLevelConfig(ssm=SSMConfig(**ssm_dict), **cfg_dict_clean)
 
     kwargs: Dict[str, Any] = {
         "stop_event": stop_event,

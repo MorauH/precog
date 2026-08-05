@@ -20,15 +20,69 @@ import time
 from typing import Dict, List, Optional
 
 import torch
+import torch.nn as nn
 
 from precog.messaging import ShmRingBuffer, WeightSync
 from precog.model import (
     DEFAULT_CONFIG,
-    HierarchicalPCWorldModel,
     PerLevelSnapshot,
     replay_learn_level,
 )
 from precog.model.config import ModelConfig
+from precog.model.control_head import ControlHead
+from precog.model.pc_level_jepa import PCLevel
+
+
+def _build_levels_and_control(
+    config: ModelConfig,
+    device: torch.device,
+) -> tuple[nn.ModuleList, ControlHead, int]:
+    """Construct PCLevel list and ControlHead directly (no HierarchicalPCWorldModel)."""
+    prev_dim = config.d_input
+    levels: nn.ModuleList = nn.ModuleList()
+    for i, level_cfg in enumerate(config.level_configs):
+        levels.append(
+            PCLevel(
+                d_below=prev_dim,
+                d_above=None
+                if i == len(config.level_configs) - 1
+                else level_cfg.d_representation,
+                config=level_cfg,
+            ).to(device)
+        )
+        prev_dim = level_cfg.d_representation
+
+    ctrl_cfg = config.control_head
+    control_level_idx = config.control_level_idx
+    control_input_dim = config.level_configs[control_level_idx].d_representation
+    control_head = ControlHead(
+        input_dim=control_input_dim,
+        hidden_dims=ctrl_cfg.hidden_dims,
+        output_dim=ctrl_cfg.output_dim,
+        output_scales=ctrl_cfg.output_scales or None,
+    ).to(device)
+
+    return levels, control_head, control_level_idx
+
+
+def _get_weights(
+    levels: nn.ModuleList,
+    control_head: ControlHead,
+    control_level_idx: int,
+    level_idx: int,
+) -> dict[str, torch.Tensor]:
+    """Return a CPU copy of the level's state_dict and its control head."""
+    state: dict[str, torch.Tensor] = {}
+    for name, param in levels[level_idx].named_parameters():
+        state[f"level.{name}"] = param.data.detach().cpu().clone()
+    for name, buf in levels[level_idx].named_buffers():
+        state[f"level.{name}"] = buf.data.detach().cpu().clone()
+    if level_idx == control_level_idx:
+        for name, param in control_head.named_parameters():
+            state[f"control_head.{name}"] = param.data.detach().cpu().clone()
+        for name, buf in control_head.named_buffers():
+            state[f"control_head.{name}"] = buf.data.detach().cpu().clone()
+    return state
 
 
 def run_learner(
@@ -69,16 +123,16 @@ def run_learner(
 
     config = config or DEFAULT_CONFIG
 
-    learner_model = HierarchicalPCWorldModel(config).to(device_torch)
-    learner_model.train()
-
-    ctrl_idx = config.control_level_idx
+    levels, control_head, ctrl_idx = _build_levels_and_control(config, device_torch)
+    for level in levels:
+        level.train()
+    control_head.train()
 
     optimizers: List[torch.optim.Optimizer] = []
-    for i, level in enumerate(learner_model.levels):
+    for i, level in enumerate(levels):
         param_groups = [{"params": level.parameters()}]
         if i == ctrl_idx:
-            param_groups.append({"params": learner_model.control_head.parameters()})
+            param_groups.append({"params": control_head.parameters()})
         optimizers.append(torch.optim.AdamW(param_groups, lr=learning_rate))
 
     weight_versions: Dict[int, int] = {}
@@ -90,7 +144,7 @@ def run_learner(
         last_sync[ws.level_idx] = time.monotonic()
         staleness_samples[ws.level_idx] = []
 
-    num_levels = len(learner_model.levels)
+    num_levels = len(levels)
 
     print(
         f"[Learner] Started on {device}, {num_levels} levels, "
@@ -108,7 +162,7 @@ def run_learner(
 
         for level_idx in range(num_levels):
             ring = experience_rings[level_idx]
-            level = learner_model.levels[level_idx]
+            level = levels[level_idx]
             optimizer = optimizers[level_idx]
 
             raw_snapshots = ring.read_all(max_count=batch_max_size)
@@ -136,7 +190,7 @@ def run_learner(
             if not snapshots:
                 continue
 
-            ctrl_head = learner_model.control_head if level_idx == ctrl_idx else None
+            ctrl_head = control_head if level_idx == ctrl_idx else None
 
             t0 = time.monotonic()
             total_loss = replay_learn_level(
@@ -157,7 +211,7 @@ def run_learner(
             if now - last_sync.get(level_idx, 0.0) >= sync_interval_seconds:
                 ws = weight_syncs[level_idx]
 
-                weights = learner_model.get_weights(level_idx)
+                weights = _get_weights(levels, control_head, ctrl_idx, level_idx)
 
                 ws.write_state_dict(weights)
                 last_sync[level_idx] = now

@@ -26,10 +26,13 @@ from precog.envs.ros.source_selector import SourceSelector
 from precog.model import (
     DEFAULT_CONFIG,
     ForwardOutput,
-    HierarchicalPCWorldModel,
     PerLevelSnapshot,
 )
 from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
+from precog.model.control_head import ControlHead
+from precog.model.hierarchical_clock import ClockConfig, HierarchicalClock
+from precog.model.level_state import LevelState
+from precog.model.pc_level_jepa import PCLevel
 from precog.messaging import ShmRingBuffer, WeightSync
 from precog.processes.action_utils import action_from_obs, action_to_dict
 
@@ -52,9 +55,34 @@ def _set_realtime(priority: int, core: Optional[int]) -> None:
             + (f" core={core}" if core is not None else "")
         )
     except PermissionError:
-        print("[L0] WARNING: Cannot set SCHED_FIFO — run with CAP_SYS_NICE or as root")
+        print("[L0] WARNING: Cannot set SCHED_FIFO -- run with CAP_SYS_NICE or as root")
     except Exception as e:
         print(f"[L0] WARNING: Scheduling config failed: {e}")
+
+
+def _encode_level0(
+    obs_dict: Dict[str, torch.Tensor],
+    prev_action: Optional[torch.Tensor],
+    observation_keys: List[str],
+    observation_shapes: Dict[str, tuple],
+    action_scales: torch.Tensor,
+    control_dim: int,
+    batch_size: int,
+    device: str,
+) -> torch.Tensor:
+    """Concatenate observation values and optional prev_action into a flat level-0 input."""
+    parts = []
+    for key in observation_keys:
+        value = obs_dict.get(key)
+        if value is None:
+            shape = observation_shapes.get(key, (1, 0))
+            value = torch.zeros(batch_size, shape[-1], device=device)
+        parts.append(value)
+    if prev_action is not None:
+        parts.append(prev_action / action_scales)
+    else:
+        parts.append(torch.zeros(batch_size, control_dim, device=device))
+    return torch.cat(parts, dim=-1)
 
 
 def run_level0(
@@ -82,7 +110,7 @@ def run_level0(
         upward_writer_proxy: (name, shape, dtype_str) tuple for sending z0 to L1.
         downward_reader_proxy: (name, shape, dtype_str) tuple for reading
             pred_from_above from L1.
-        rt_priority: SCHED_FIFO priority (1–99). Higher = higher priority.
+        rt_priority: SCHED_FIFO priority (1-99). Higher = higher priority.
             Set to 0 to skip scheduling change.
         rt_core: CPU core to pin L0 to (0-indexed). None = no pinning.
     """
@@ -108,18 +136,47 @@ def run_level0(
     source_selector.blend_ratio_steer = 0.0
     source_selector.blend_ratio_acc = 0.0
 
-    model = HierarchicalPCWorldModel(config).to(device)
+    # ------------------------------------------------------------------ #
+    # Direct component construction (no HierarchicalPCWorldModel)
+    # ------------------------------------------------------------------ #
+
+    level = PCLevel(
+        d_below=config.d_input,
+        d_above=config.level_configs[0].d_representation
+        if len(config.level_configs) > 1
+        else None,
+        config=config.level_configs[0],
+    ).to(device)
+
+    ctrl_cfg = config.control_head
+    control_level_idx = config.control_level_idx
+    control_input_dim = config.level_configs[control_level_idx].d_representation
+    control_head = ControlHead(
+        input_dim=control_input_dim,
+        hidden_dims=ctrl_cfg.hidden_dims,
+        output_dim=ctrl_cfg.output_dim,
+        output_scales=ctrl_cfg.output_scales or None,
+    ).to(device)
 
     if level_frequencies is None:
         level_frequencies = [200, 100]
 
-    runner = model.build_runner(
-        level_frequencies=level_frequencies,
-        time_scale=1.0,
-        batch_size=1,
-        device=device,
-        online_learning=False,
+    clock = HierarchicalClock(
+        ClockConfig(level_frequencies=level_frequencies, time_scale=1.0)
     )
+
+    d_state = level.ssm.d_state
+    d_repr = level.d_repr
+    level_state = LevelState.init(
+        level_idx=0, d_state=d_state, d_repr=d_repr, batch_size=1, device=device
+    )
+
+    if control_head.output_scales is not None:
+        action_scales = control_head.output_scales.to(device)
+    else:
+        action_scales = torch.ones(config.control_dim, device=device)
+
+    # ------------------------------------------------------------------ #
 
     dashboard = None
     if not headless:
@@ -162,7 +219,7 @@ def run_level0(
     _last_gc_collect = 0
     _exp_write_interval = 2  # write experience every 2 ticks (~100Hz at 200Hz)
 
-    runner.clock.reset()
+    clock.reset()
 
     gc.disable()
 
@@ -201,12 +258,85 @@ def run_level0(
                 if raw is not None:
                     a_t = raw.to(torch.device(device))
 
-            # Level 0 forward pass only (no upper levels)
-            fwd: ForwardOutput = runner.forward_level0(
+            clock.tick()
+            current_tick = clock._tick_count
+            sim_time = clock.sim_time()
+
+            # Encode observations
+            z_level0 = _encode_level0(
                 obs,
                 prev_action,
-                a_t=a_t,
+                config.observation_keys,
+                config.observation_shapes,
+                action_scales,
+                config.control_dim,
+                1,
+                device,
             )
+
+            # NaN guard
+            if torch.isnan(z_level0).any():
+                fwd = ForwardOutput(
+                    action=torch.zeros(1, config.control_dim, device=device),
+                    level_snapshots=[],
+                    updated_levels=[],
+                    level_states=[level_state],
+                    sim_time=sim_time,
+                    total_surprise=None,
+                    tick_count=current_tick,
+                )
+            else:
+                h_in = level_state.hidden.detach()
+                z_t_pred = (
+                    level_state.last_z_pred.detach()
+                    if level_state.last_z_pred is not None
+                    else None
+                )
+
+                a_t_single = a_t.detach().to(device) if a_t is not None else None
+
+                z_t_out, z_next_pred, h_new, z_delta, x_star = level.step(
+                    z_level0, h_in, a_t_single, z_t_pred, None
+                )
+
+                surprise_i = z_delta.pow(2).mean()
+                sigreg_mean = level.sigreg._mean.detach().clone()
+                sigreg_outer = level.sigreg._outer.detach().clone()
+
+                snapshot = PerLevelSnapshot(
+                    level_idx=0,
+                    signal_from_below=z_level0.detach(),
+                    h_init=h_in.detach(),
+                    a_t=a_t_single.detach() if a_t_single is not None else None,
+                    z_t_pred=z_t_pred.detach() if z_t_pred is not None else None,
+                    task_target=None,
+                    x_actual=None,
+                    prev_action=prev_action.detach(),
+                    sigreg_mean=sigreg_mean,
+                    sigreg_outer=sigreg_outer,
+                    is_single_step=True,
+                )
+
+                level_state.update(
+                    hidden=h_new.detach(),
+                    z=z_t_out.detach(),
+                    z_pred=z_next_pred.detach(),
+                    pred_error=z_delta.detach(),
+                    tick=current_tick,
+                    sim_time=sim_time,
+                )
+
+                action = control_head(z_t_out.unsqueeze(1))[:, -1]
+
+                fwd = ForwardOutput(
+                    action=action,
+                    level_snapshots=[snapshot],
+                    updated_levels=[0],
+                    level_states=[level_state],
+                    sim_time=sim_time,
+                    total_surprise=surprise_i,
+                    tick_count=current_tick,
+                )
 
             # Send z0 upward to L1
             if upward_writer is not None and fwd.level_states:
@@ -219,18 +349,17 @@ def run_level0(
                 experience_rings[0].write(fwd.level_snapshots[0])
 
             # Version-guarded weight sync — L0 only syncs its own level
-            # (L1 weights are synced by the L1 process)
             if tick_count % 4 == 0:
                 ws = weight_syncs[0]
                 new_ver = ws.read_latest_if_new(
-                    model.levels[0],
+                    level,
                     weight_versions[0],
                     device=torch.device(device),
                 )
                 if new_ver != weight_versions[0]:
                     weight_versions[0] = new_ver
                     ws.read_latest(
-                        model.control_head,
+                        control_head,
                         device=torch.device(device),
                     )
                     print(f"[L0] Updated weights (v{new_ver})")
@@ -279,7 +408,7 @@ def run_level0(
                 ma = fwd.action[0].tolist()
                 print(f"[L0] tick={tick_count}  action=[{ma[0]:.4f}, {ma[1]:.4f}]")
 
-            runner.clock.sleep_until_next_tick()
+            clock.sleep_until_next_tick()
 
     except KeyboardInterrupt:
         pass

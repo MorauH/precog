@@ -40,12 +40,6 @@ def main():
         help="Number of PC levels (default: 2)",
     )
     parser.add_argument(
-        "--ctrl-level",
-        type=int,
-        default=0,
-        help="Index of the control level (default: 0)",
-    )
-    parser.add_argument(
         "--lr",
         type=float,
         default=1e-3,
@@ -105,15 +99,10 @@ def main():
 
     launcher = Launcher(
         num_levels=args.num_levels,
-        ctrl_level_idx=args.ctrl_level,
         device=args.device,
         headless=args.headless,
         dashboard_port=args.dashboard_port,
         level_frequencies=level_frequencies,
-        learning_rate=args.lr,
-        ctrl_weight=args.ctrl_weight,
-        staleness_max=args.staleness_max,
-        sync_interval=args.sync_interval,
         rt_priority=args.rt_priority,
         rt_core=args.rt_core,
     )

@@ -16,17 +16,11 @@ import torch
 
 from precog.envs import ROSEnvironment
 from precog.envs.ros.source_selector import SourceSelector
-from precog.model import (
-    DEFAULT_CONFIG,
-    ForwardOutput,
-    PerLevelSnapshot,
-)
+from precog.messaging import ShmTensorSlot
+from precog.model import DEFAULT_CONFIG
 from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
 from precog.model.control_head import ControlHead
-from precog.model.hierarchical_clock import ClockConfig, HierarchicalClock
-from precog.model.level_state import LevelState
-from precog.model.pc_level_jepa import PCLevel
-from precog.messaging import ShmRingBuffer
+from precog.model.hierarchical_clock import LevelClock
 from precog.processes.action_utils import action_from_obs, action_to_dict
 
 def _set_realtime(priority: int, core: Optional[int]) -> None:
@@ -76,12 +70,12 @@ def _format_inputs(
 def run_world(
     stop_event: multiprocessing.Event,
     *,
-    upward_writer: ShmTensorSlot,          # → L0 signal_below
-    downward_reader: ShmTensorSlot,        # ← L0 z_next_pred (or action signal)
-    control_repr_reader: Optional[ShmTensorSlot] = None,  # if control lives on a higher level
+    clock: LevelClock,
+    upward_writer: ShmTensorSlot,
+    downward_reader: ShmTensorSlot,
+    control_repr_reader: Optional[ShmTensorSlot] = None,
     headless: bool = True,
     dashboard_port: int = 8080,
-    frequency: Optional[float] = 200,
     rt_priority: int = 50,
     rt_core: Optional[int] = None,
 ):
@@ -119,10 +113,6 @@ def run_world(
     else:
         action_scales = torch.ones(config.control_dim, device=device)
 
-    clock = HierarchicalClock(
-        ClockConfig(level_frequencies=[frequency], time_scale=1.0)
-    )
-    
     dashboard = None
     if not headless:
         try:
@@ -144,7 +134,6 @@ def run_world(
     _hz = 0.0
     _last_gc_collect = 0
 
-    clock.reset()
     gc.disable()
 
     try:
@@ -182,8 +171,8 @@ def run_world(
                     signal_down = raw.to(torch.device(device))
 
             clock.tick()
-            current_tick = clock._tick_count
-            sim_time = clock.sim_time()
+            current_tick = clock.tick_count
+            sim_time = clock.sim_time
 
             formatted_input = _format_inputs(
                 obs,
@@ -221,19 +210,13 @@ def run_world(
                 _last_gc_collect = tick_count
 
             if dashboard is not None and tick_count % 10 == 0:
-                ma = fwd.action[0].tolist()
+                ma = action[0].tolist()
                 pa = prev_action[0].tolist()
                 ea = (
                     expert_action[0].tolist()
                     if expert_action is not None
                     else [None] * len(action_keys)
                 )
-                surprise = []
-                for ls in fwd.level_states:
-                    if ls.last_pred_error is not None:
-                        surprise.append(ls.last_pred_error.pow(2).mean().item())
-                    else:
-                        surprise.append(0.0)
                 dashboard.update(
                     {
                         "tick": tick_count,
@@ -244,12 +227,12 @@ def run_world(
                         "prev_action": pa,
                         "expert_action": ea,
                         "source_selector": source_selector.snapshot(),
-                        "surprise": surprise,
+                        "surprise": [],
                     }
                 )
 
             if tick_count % 200 == 0:
-                ma = fwd.action[0].tolist()
+                ma = action[0].tolist()
                 print(f"[L0] tick={tick_count}  action=[{ma[0]:.4f}, {ma[1]:.4f}]")
 
             clock.sleep_until_next_tick()

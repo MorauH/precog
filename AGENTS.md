@@ -65,31 +65,54 @@ python src/precog/test_read_env.py
 ```
 src/precog/
   envs/ros/
-    codecs.py           Pluggable msg↔array codecs + cross-key transforms
-    ros.py              ROSEnvironment Node (Gym-like reset/step API)
-    env_config.yaml     Declarative topic mapping
-    source_selector.py  Multi-source input selection
+    codecs.py            Pluggable msg↔array codecs + cross-key transforms
+    ros.py               ROSEnvironment Node (Gym-like reset/step API)
+    env_config.yaml      Declarative topic mapping
+    source_selector.py   Multi-source input selection
+  messaging/
+    clock.py             ShmBeat — shared-memory tick counter with back-pressure
+    slot.py              ShmTensorSlot — seqlock-protected tensor channel
+    ring_buffer.py       ShmRingBuffer — lock-free ring buffer (legacy)
+    weight_sync.py       WeightSync — double-buffered state dict handoff (legacy)
   model/
-    model.py            HierarchicalPCWorldModel entry point
-    pc_level_jepa.py    JEPA PC level (encoder + SSM)
-    ssm.py              Selective State Space Model (Mamba-like)
-    config.py           ModelConfig, DEFAULT_CONFIG
-    hierarchical_clock.py  Multi-rate tick scheduling
-    level_state.py      Per-level runtime state
-    multi_rate_runner.py   Multi-frequency clock + forward orchestrator
+    pc_level_jepa.py     JEPA PC level (encoder + SSM)
+    ssm.py               Selective State Space Model (Mamba-like)
+    config.py            ModelConfig, DEFAULT_CONFIG
+    hierarchical_clock.py  LevelClock — per-process clock backed by ShmBeat
+    level_state.py       Per-level runtime state
+    control_head.py      Action prediction head
+    fnn.py               Feed-forward network building block
+    sigreg.py            Signal variance regularisation
   processes/
-    level0.py           L0 forward process (ROS → action)
-    level_n.py          Generic upper-level forward process
-    learner.py          Learner process (replay + backward + step)
-    launcher.py         Orchestrator / supervisor
-    cli.py              CLI entry point
-    action_utils.py     Shared ROS action helpers
+    world.py             L0 process (ROS bridge + input formatting + control head)
+    level_n.py           Generic upper-level forward process (online learning)
+    launcher.py          Orchestrator / supervisor
+    cli.py               CLI entry point
+    action_utils.py      Shared ROS action helpers
   dashboard/
-    server.py           FastAPI live monitoring server (lazy import)
+    server.py            FastAPI live monitoring server (lazy import)
 ```
 
 **Data flow**: `ROS topics → codec (msg→array) → snapshot → transforms (cross-key feature
 engineering) → model`
+
+## Clock & Timing
+
+A shared-memory tick counter (`ShmBeat` in `messaging/clock.py`) synchronises all
+process levels:
+
+- **L0 (world)** is the **writer** — calls `beat()` each cycle, which blocks until
+  every L1+ level has signalled completion (`mark_done()`). If any level falls behind,
+  the entire system stalls at L0's tick rate (no catch-up bursts).
+- **L1..Ln** are **readers** — call `wait_tick()` to wait for a new tick, then
+  `mark_done()` after their forward pass. Decimation via integer divisor determines
+  per-level firing rate (e.g. divisor=10 → fires every 10th base tick).
+
+Each process wraps a `ShmBeat` in a `LevelClock` (`model/hierarchical_clock.py`)
+for convenient access to `tick()`, `should_update()`, `wait_tick()`, `mark_done()`,
+and `sleep_until_next_tick()`.
+
+All frequencies must be integer divisors of the base (fastest) frequency.
 
 ## Code Style
 

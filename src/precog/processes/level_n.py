@@ -7,10 +7,9 @@ Each upper-level process:
   3. Accumulates z_below values into sequences.
   4. On its own tick cadence, runs the SSM forward pass.
   5. Sends its representation upward and its prediction downward.
-  6. Pushes experience to the Learner's ring buffer.
-  7. Reads updated weights from the Learner via WeightSync.
+  6. Does online learning (forward-only, backward on its own tick).
 
-Never calls backward().
+Never calls backward() from a separate learner.
 """
 
 from __future__ import annotations
@@ -24,15 +23,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from precog.messaging import (
-    ShmRingBuffer,
-    ShmTensorSlot,
-)
-from precog.model import (
-    ClockConfig,
-    HierarchicalClock,
-    PCLevel,
-)
+from precog.messaging import ShmTensorSlot
+from precog.model import LevelClock, PCLevel
 from precog.model.config import PCLevelConfig
 
 
@@ -44,7 +36,8 @@ def run_level_n(
     d_below: int,
     d_above: Optional[int],
     *,
-    frequency: float,
+    clock: LevelClock,
+    frequency: float = 0.0,
     upward_reader: Optional[ShmTensorSlot] = None,
     upward_writer: Optional[ShmTensorSlot] = None,
     downward_reader: Optional[ShmTensorSlot] = None,
@@ -96,12 +89,6 @@ def run_level_n(
         online_tau=config.sigreg_tau,
         var_threshold=config.sigreg_var_threshold,
     ).to(dev)
-
-    clock_cfg = ClockConfig(
-        level_frequencies=[frequency],
-        time_scale=1.0,
-    )
-    clock = HierarchicalClock(clock_cfg)
 
     batch_size = 1
     h_state = level.init_hidden(batch_size, dev)
@@ -160,9 +147,9 @@ def run_level_n(
             accumulated_below = [signal_below]
             accumulated_above = [cur_above] if cur_above is not None else []
 
-        clock.tick()
+        clock.wait_tick()
 
-        if not clock.should_update(0) or not accumulated_below:
+        if not clock.should_update() or not accumulated_below:
             continue
 
         # ----- Format sequence tensors
@@ -262,7 +249,9 @@ def run_level_n(
         prev_z_pred = z_next_pred.detach()
 
         accumulated_below.clear()
-        accumulated_above.clear() 
+        accumulated_above.clear()
+
+        clock.mark_done()
 
         clock.sleep_until_next_tick()
 

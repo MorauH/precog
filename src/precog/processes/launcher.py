@@ -1,22 +1,14 @@
 """
-Launcher: orchestrates spawning of all processes, monitors staleness,
-handles Learner crash recovery, and coordinates startup/shutdown.
+Launcher: orchestrates spawning of all processes and coordinates shutdown.
 
 Spawns:
   - World process (interface with env & calc control outputs)
   - Level processes (one per level, with inter-level channels)
   - Dashboard (thread in L0 or standalone)
 
-Channel inventory (total: 4N-2):
+Channel inventory (total: 2N-2):
   - Upward slots (N-1): Level L → Level L+1  (z_L)
   - Downward slots (N-1): Level L+1 → Level L (pred_from_above)
-  - Experience queues (N): Each level → Learner
-  - Weight sync channels (N): Learner → Each level
-
-The launcher acts as supervisor:
-  - If Learner crashes, L0 continues driving on last-known-good weights.
-  - Launcher restarts Learner transparently.
-  - Stopping L0 signal-cascades to all child processes.
 """
 
 from __future__ import annotations
@@ -32,7 +24,7 @@ import numpy as np
 import torch
 import yaml
 
-from precog.messaging import ShmRingBuffer, ShmTensorSlot, WeightSync
+from precog.messaging import ShmBeat, ShmTensorSlot
 from precog.model import DEFAULT_CONFIG
 from precog.model.config import _env_shapes_from_yaml, resolve_config_dims
 
@@ -43,7 +35,9 @@ def _worker_world(
     stop_event,
     headless,
     dashboard_port,
-    frequency,
+    beat_name,
+    num_levels,
+    base_frequency,
     upward_writer_proxy,
     downward_reader_proxy,
     rt_priority,
@@ -51,15 +45,26 @@ def _worker_world(
 ):
     """Wrapper that catches exceptions in the world worker."""
     from precog.processes.world import run_world
+    from precog.messaging.clock import ShmBeat
+    from precog.model.hierarchical_clock import LevelClock
+
+    beat = ShmBeat(beat_name, num_levels, create=False,
+                   base_frequency=base_frequency)
+    clock = LevelClock.writer(beat)
+
+    upward_writer = (_ShmWriterHandle(*upward_writer_proxy).writer()
+                     if upward_writer_proxy is not None else None)
+    downward_reader = (_ShmReaderHandle(*downward_reader_proxy).reader()
+                       if downward_reader_proxy is not None else None)
 
     try:
         run_world(
             stop_event,
+            clock=clock,
+            upward_writer=upward_writer,
+            downward_reader=downward_reader,
             headless=headless,
             dashboard_port=dashboard_port,
-            frequency=frequency,
-            upward_writer_proxy=upward_writer_proxy,
-            downward_reader_proxy=downward_reader_proxy,
             rt_priority=rt_priority,
             rt_core=rt_core,
         )
@@ -76,6 +81,9 @@ def _worker_level_n(
     d_below,
     d_above,
     frequency,
+    beat_name,
+    num_levels,
+    base_frequency,
     upward_reader,
     upward_writer,
     downward_reader,
@@ -85,6 +93,13 @@ def _worker_level_n(
     """Wrapper that catches exceptions in an level worker."""
     from precog.processes.level_n import run_level_n
     from precog.model.config import PCLevelConfig, SSMConfig
+    from precog.messaging.clock import ShmBeat
+    from precog.model.hierarchical_clock import LevelClock
+
+    beat = ShmBeat(beat_name, num_levels, create=False,
+                   base_frequency=base_frequency)
+    divisor = round(base_frequency / frequency)
+    clock = LevelClock.reader(beat, divisor=divisor, level_idx=level_idx)
 
     cfg_dict_clean = config_dict.copy()
     ssm_dict = cfg_dict_clean.pop("ssm", {})
@@ -96,6 +111,7 @@ def _worker_level_n(
         "config": cfg,
         "d_below": d_below,
         "d_above": d_above,
+        "clock": clock,
         "frequency": frequency,
         "device": device,
         "obj_key": cfg.objective_observable_key,
@@ -155,10 +171,6 @@ class Launcher:
         headless: bool = True,
         dashboard_port: int = 8080,
         level_frequencies: Optional[List[float]] = None,
-        learning_rate: float = 1e-3,
-        ctrl_weight: float = 1.0,
-        staleness_max: int = 5000,
-        sync_interval: float = 1.0,
         rt_priority: int = 0,
         rt_core: Optional[int] = None,
     ):
@@ -169,10 +181,6 @@ class Launcher:
         self._headless = headless
         self._dashboard_port = dashboard_port
         self._level_frequencies = level_frequencies
-        self._learning_rate = learning_rate
-        self._ctrl_weight = ctrl_weight
-        self._staleness_max = staleness_max
-        self._sync_interval = sync_interval
         self._rt_priority = rt_priority
         self._rt_core = rt_core
 
@@ -195,7 +203,7 @@ class Launcher:
     def _auto_frequencies(self) -> List[float]:
         if self._level_frequencies:
             return self._level_frequencies
-        base = max(200.0, 200.0)
+        base = 200.0
         return [base / (2**i) for i in range(self._num_levels)]
 
     def start(self) -> None:
@@ -206,7 +214,10 @@ class Launcher:
         freqs = self._auto_frequencies()
 
         self._create_channels(ctx)
-        self._spawn_world(ctx)
+        base_freq = max(freqs)
+        self._beat = ShmBeat("main", self._num_levels, create=True,
+                             base_frequency=base_freq)
+        self._spawn_world(ctx, base_freq)
         self._spawn_levels(ctx, freqs)
 
         self._supervise()
@@ -298,6 +309,7 @@ class Launcher:
                 "translator_hidden": lvl_cfg.translator_hidden,
             }
 
+            base_freq = max(freqs)
             kwargs = {
                 "stop_event": self._stop_event,
                 "level_idx": i,
@@ -305,6 +317,9 @@ class Launcher:
                 "d_below": d_below,
                 "d_above": d_above,
                 "frequency": freqs[i],
+                "beat_name": "main",
+                "num_levels": self._num_levels,
+                "base_frequency": base_freq,
                 "upward_reader": upward_reader,
                 "upward_writer": upward_writer,
                 "downward_reader": downward_reader,
@@ -343,11 +358,14 @@ class Launcher:
             str(slot_down._dtype),
         )
 
+        base_freq = max(self._level_frequencies) if self._level_frequencies else freq
         world_kwargs = {
             "stop_event": self._stop_event,
             "headless": self._headless,
             "dashboard_port": self._dashboard_port,
-            "frequency": freq,
+            "beat_name": "main",
+            "num_levels": self._num_levels,
+            "base_frequency": base_freq,
             "upward_writer_proxy": upward_writer_proxy,
             "downward_reader_proxy": downward_reader_proxy,
             "rt_priority": self._rt_priority,
@@ -428,5 +446,8 @@ class Launcher:
             slot.close()
         for slot in self._downward_slots:
             slot.close()
+
+        if hasattr(self, "_beat"):
+            self._beat.unlink()
 
         print("[Launcher] All processes stopped")

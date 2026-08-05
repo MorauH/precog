@@ -19,48 +19,22 @@ import multiprocessing
 import time
 from typing import List, Optional
 
+from precog.model.pc_level_jepa import PCLevelOutput
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from precog.messaging import (
     ShmRingBuffer,
     ShmTensorSlot,
-    WeightSync,
 )
-from precog.messaging.weight_sync import deserialize_to_model  # noqa: F401
 from precog.model import (
     ClockConfig,
     HierarchicalClock,
     PCLevel,
-    PerLevelSnapshot,
 )
 from precog.model.config import PCLevelConfig
 
-
-def _snapshot_from_step(
-    level_idx: int,
-    signal_from_below: torch.Tensor,
-    h_init: torch.Tensor,
-    a_t: Optional[torch.Tensor],
-    z_t_pred: Optional[torch.Tensor],
-    task_target: Optional[torch.Tensor],
-    x_actual: Optional[torch.Tensor],
-    sigreg_mean: torch.Tensor,
-    sigreg_outer: torch.Tensor,
-    prev_action: Optional[torch.Tensor],
-) -> PerLevelSnapshot:
-    return PerLevelSnapshot(
-        level_idx=level_idx,
-        signal_from_below=signal_from_below.detach().cpu(),
-        h_init=h_init.detach().cpu(),
-        a_t=a_t.detach().cpu() if a_t is not None else None,
-        z_t_pred=z_t_pred.detach().cpu() if z_t_pred is not None else None,
-        task_target=task_target.detach().cpu() if task_target is not None else None,
-        x_actual=x_actual.detach().cpu() if x_actual is not None else None,
-        prev_action=prev_action.detach().cpu() if prev_action is not None else None,
-        sigreg_mean=sigreg_mean.detach().cpu().clone(),
-        sigreg_outer=sigreg_outer.detach().cpu().clone(),
-        is_single_step=True,
-    )
 
 
 def run_level_n(
@@ -71,16 +45,16 @@ def run_level_n(
     d_above: Optional[int],
     *,
     frequency: float,
-    experience_ring: ShmRingBuffer,
-    weight_sync: WeightSync,
     upward_reader: Optional[ShmTensorSlot] = None,
     upward_writer: Optional[ShmTensorSlot] = None,
     downward_reader: Optional[ShmTensorSlot] = None,
     downward_writer: Optional[ShmTensorSlot] = None,
+    task_actual_reader: Optional[ShmTensorSlot] = None,
     device: str = "cpu",
     accumulate_for_forward: bool = True,
     obj_key: str = "",
     obj_target: float = 0.0,
+    lr: float = 0e-3,
 ):
     """Entry point for an upper-level forward process.
 
@@ -91,17 +65,17 @@ def run_level_n(
         d_below: Dimension of the level below's representation.
         d_above: Dimension of the level above's representation (None if top).
         frequency: Tick rate in Hz for this level.
-        experience_ring: Ring buffer for sending experience to the Learner.
-        weight_sync: WeightSync for receiving updated parameters.
         upward_reader: Reads z_below from the level below.
         upward_writer: Writes z_t upward to the level above.
         downward_reader: Reads pred_from_above from the level above.
         downward_writer: Writes pred_below downward to the level below.
+        task_actual_reader: Reads task reference value.
         device: Torch device for computation.
         accumulate_for_forward: If True, accumulate z_below into sequences
             before forward pass. If False, use single-step every tick.
         obj_key: Observable key for objective (empty if disabled).
         obj_target: Target value for objective.
+        lr: Learning rate for online weight updates.
     """
     dev = torch.device(device)
 
@@ -109,6 +83,18 @@ def run_level_n(
         d_below=d_below,
         d_above=d_above,
         config=config,
+    ).to(dev)
+    level.train()
+
+    optimizer = torch.optim.AdamW(level.parameters(), lr=lr, weight_decay=1e-4)
+    
+    loss_translate_weight = config.objective_ae_weight if config.objective_enabled else 0.0
+    loss_task_weight = config.objective_task_weight if config.objective_enabled else 0.0
+    
+    sigreg_loss_fn = SIGReg(
+        d_repr=config.d_representation,
+        online_tau=config.sigreg_tau,
+        var_threshold=config.sigreg_var_threshold,
     ).to(dev)
 
     clock_cfg = ClockConfig(
@@ -119,70 +105,73 @@ def run_level_n(
 
     batch_size = 1
     h_state = level.init_hidden(batch_size, dev)
-    z_t_pred_state: Optional[torch.Tensor] = None
+    prev_z_pred: Optional[torch.Tensor] = None
+    last_signal_above: Optional[torch.Tensor] = None # Hold value as this updates slower
+    task_actual: Optional[torch.Tensor] = None # Hold value as this updates slower
 
-    accumulated: List[torch.Tensor] = []
-    a_t_accumulated: List[torch.Tensor] = []
-
-    weight_version = 0
+    accumulated_below: List[torch.Tensor] = []
+    accumulated_above: List[torch.Tensor] = []
 
     print(
-        f"[L{level_idx}] Started on {device}, "
+        f"[L{level_idx}] Started Online Learning on {device}, "
         f"d_below={d_below}, d_repr={config.d_representation}, "
-        f"d_above={d_above}, freq={frequency}Hz"
+        f"d_above={d_above}, freq={frequency}Hz, lr={lr}"
     )
 
-    _last_print = 0.0
-    _tick_count = 0
-
     while not stop_event.is_set():
-        signal_from_below: Optional[torch.Tensor] = None
+        #  ----- Read bottom up signal
+        signal_below: Optional[torch.Tensor] = None
         if upward_reader is not None:
-            raw = upward_reader.read(timeout_us=10000)
-            if raw is not None:
-                signal_from_below = raw.to(dev)
+            raw_below = upward_reader.read(timeout_us=10000)
+            if raw_below is not None:
+                signal_below = raw_below.to(dev)
 
-        a_t: Optional[torch.Tensor] = None
+        # ----- Read (or hold) top-down signal
         if downward_reader is not None:
-            raw = downward_reader.read(timeout_us=5000)
-            if raw is not None:
-                a_t = raw.to(dev)
+            raw_above = downward_reader.read(timeout_us=5000)
+            if raw_above is not None:
+                last_signal_above = raw_above.to(dev)
 
-        if signal_from_below is None:
+        # ----- Read task actual reference value
+        if task_actual_reader is not None:
+            raw_task = task_actual_reader.read(timeout_us=5000)
+            if raw_task is not None:
+                task_actual = raw_task.to(dev)
+
+        if signal_below is None:
             time.sleep(0.0001)
             continue
 
-        _tick_count += 1
-
-        new_ver, ws_data = weight_sync.read_latest_bytes_if_new(weight_version)
-        if ws_data is not None:
-            deserialize_to_model(level, ws_data, dev)
-            weight_version = new_ver
-            now = time.monotonic()
-            if now - _last_print > 5.0:
-                print(f"[L{level_idx}] weights updated (v{new_ver})")
-                _last_print = now
+        if d_above is not None:
+            # Forward-fill last seen signal from above; fallback to zeros if none received yet
+            cur_above = (
+                last_signal_above
+                if last_signal_above is not None
+                else torch.zeros(batch_size, d_above, device=dev)
+            )
+        else:
+            cur_above = None
 
         if accumulate_for_forward:
-            accumulated.append(signal_from_below)
-            if a_t is not None:
-                a_t_accumulated.append(a_t)
+            accumulated_below.append(signal_below)
+            if cur_above is not None:
+                accumulated_above.append(cur_above)
         else:
-            accumulated = [signal_from_below]
-            a_t_accumulated = [a_t] if a_t is not None else []
+            accumulated_below = [signal_below]
+            accumulated_above = [cur_above] if cur_above is not None else []
 
         clock.tick()
 
-        if not clock.should_update(0):
+        if not clock.should_update(0) or not accumulated_below:
             continue
 
-        if not accumulated:
-            continue
-
-        seq = torch.stack(accumulated, dim=1)
-        a_seq = None
-        if a_t_accumulated and a_t_accumulated[0] is not None:
-            a_seq = torch.stack(a_t_accumulated, dim=1)
+        # ----- Format sequence tensors
+        seq_below = torch.stack(accumulated_below, dim=1)
+        seq_above = (
+            torch.stack(accumulated_above, dim=1)
+            if accumulated_above
+            else None
+        )
 
         task_target = None
         x_actual = None
@@ -191,48 +180,89 @@ def run_level_n(
 
         h_in = h_state.detach()
 
-        if seq.shape[1] == 1:
-            a_t_single = a_seq[:, 0] if a_seq is not None else None
-            z_t, z_next_pred, h_new, z_delta, x_star = level.step(
-                seq[:, 0], h_in, a_t_single, z_t_pred_state, task_target
+        optimizer.zero_grad()
+
+        # ----- Forward pass
+        if seq_below.shape[1] == 1:
+            # Single step
+            out: PCLevelOutput = level.step(
+                signal_below = seq_below[:, 0],
+                h_prev = h_in,
+                signal_above = seq_above[:, 0] if seq_above is not None else None,
+                z_t_pred = prev_z_pred,
             )
+            z_t = out.z_t
+            z_next_pred = out.z_next_pred
+            h_new = out.ssm_h
+            x_pred = out.x_pred
+
+            # Prediction loss
+            loss_pred = torch.tensor(0.0, device=dev)
+            if prev_z_pred is not None:
+                loss_z_pred = F.mse_loss(prev_z_pred, z_t.detach())
+
         else:
-            z_seq, z_next_pred_seq, h_new, z_delta_seq, _, x_star_seq = level.forward(
-                seq, h_in, a_seq, z_t_pred_state, task_target
+            # Multi-step sequence mode
+            out: PCLevelOutput = level.forward(
+                signal_below = seq_below,
+                h_0 = h_in,
+                signal_above = seq_above,
+                z_t_pred = prev_z_pred,
             )
-            z_t = z_seq[:, -1]
+            z_t_seq = out.z_t                 # (1, T, d_repr)
+            z_next_pred_seq = out.z_next_pred # (1, T, d_repr)
+
+            z_t = z_t_seq[:, -1]
             z_next_pred = z_next_pred_seq[:, -1]
-            z_delta = z_delta_seq[:, -1]
-            x_star = x_star_seq[:, -1, :] if x_star_seq is not None else None
+            h_new = out.ssm_h
+            x_pred = out.x_pred[:, -1] if out.x_pred else None
 
-        sigreg_mean = level.sigreg._mean.detach().clone()
-        sigreg_outer = level.sigreg._outer.detach().clone()
+            # Prediction loss
+            loss_pred = torch.tensor(0.0, device=dev)
+            if seq_below.shape[1] > 1:
+                preds = z_next_pred_seq[:, :-1]
+                targets = z_t_seq[:, 1:].detach()
+                loss_pred = F.mse_loss(preds, targets)
 
+            if prev_z_pred is not None:
+                # Step t-1 prediction loss
+                loss_pred = loss_pred + F.mse_loss(prev_z_pred, z_t_seq[:, 0].detach())
+
+        # ----- Loss calc
+ 
+        with torch.no_grad():
+            sigreg_loss_fn.update_online(z_t.detach())
+        loss_sigreg = sigreg_loss_fn.compute_loss_online()
+
+        # Optional task loss
+        loss_task = torch.tensor(0.0, device=dev)
+        loss_translate = torch.tensor(0.0, device=dev)
+        
+        if config.objective_enabled and x_pred is not None and task_target is not None and task_actual is not None:
+                loss_task = F.mse_loss(x_pred, task_target)
+                loss_translate = F.mse_loss(x_pred, task_actual)
+            
+        total_loss = loss_pred + loss_sigreg + (loss_task_weight * loss_task) + (loss_translate_weight * loss_translate)
+
+        # ----- Backward and optimize
+        if total_loss.requires_grad:
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(level.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        # ----- Publish outputs
         if upward_writer is not None:
             upward_writer.write(z_t)
 
         if downward_writer is not None:
             downward_writer.write(z_next_pred)
 
-        snap = _snapshot_from_step(
-            level_idx=level_idx,
-            signal_from_below=seq[:, 0],
-            h_init=h_in,
-            a_t=(a_seq[:, 0] if a_seq is not None else None),
-            z_t_pred=z_t_pred_state,
-            task_target=task_target,
-            x_actual=x_actual,
-            sigreg_mean=sigreg_mean,
-            sigreg_outer=sigreg_outer,
-            prev_action=None,
-        )
-        experience_ring.write(snap)
-
+        # ----- State update
         h_state = h_new.detach()
-        z_t_pred_state = z_next_pred.detach()
+        prev_z_pred = z_next_pred.detach()
 
-        accumulated = []
-        a_t_accumulated = []
+        accumulated_below.clear()
+        accumulated_above.clear() 
 
         clock.sleep_until_next_tick()
 

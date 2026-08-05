@@ -292,14 +292,14 @@ class Launcher:
             "sync_interval": self._sync_interval,
         }
 
-        self._learner_process = ctx.Process(
-            target=_worker_learner,
-            kwargs=learner_kwargs,
-            name="learner",
-            daemon=True,
-        )
-        self._learner_process.start()
-        print(f"[Launcher] Learner process started (pid={self._learner_process.pid})")
+        #self._learner_process = ctx.Process(
+        #    target=_worker_learner,
+        #    kwargs=learner_kwargs,
+        #    name="learner",
+        #    daemon=True,
+        #)
+        #self._learner_process.start()
+        #print(f"[Launcher] Learner process started (pid={self._learner_process.pid})")
 
     def _spawn_upper_levels(self, ctx, freqs: List[float]) -> None:
         config = self._config
@@ -460,14 +460,14 @@ class Launcher:
                     self.shutdown()
                     break
 
-                if (
-                    self._learner_process is not None
-                    and not self._learner_process.is_alive()
-                ):
-                    print("[Launcher] Learner process crashed!")
-                    if not self._stop_event.is_set():
-                        print("[Launcher] Restarting Learner...")
-                        self._start_learner()
+                #if (
+                #    self._learner_process is not None
+                #    and not self._learner_process.is_alive()
+                #):
+                #    print("[Launcher] Learner process crashed!")
+                #    if not self._stop_event.is_set():
+                #        print("[Launcher] Restarting Learner...")
+                #        self._start_learner()
 
                 for i, proc in enumerate(self._upper_processes):
                     if proc is not None and not proc.is_alive():

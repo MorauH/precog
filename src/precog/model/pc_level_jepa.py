@@ -1,61 +1,9 @@
 """
 JEPA Predictive Coding Level.
-
-Each level in the JEPA-PC hierarchy:
-
-  1. ENCODE — signal from below passes through the encoder to produce
-     the representation z_t.
-
-  2. PREDICT — SSM takes (z_t, a_t) and produces z_t+1_pred: the
-     prediction of what z will be at the next timestep.
-
-  3. COMPUTE ERROR — z_delta = z_t - z_t_pred (where z_t_pred is the
-     SSM output saved from the previous timestep) is the prediction
-     error used for training.
-
-──────────────────────────────────────────────
-JEPA information flow
-──────────────────────────────────────────────
-
-Level N+1 (higher, slower)
-  │
-  │  a_t (SSM prediction from Level N+1) ───────────┐
-  │                                                  ▼
-Level N ◄── signal_from_below ──► encoder ──► z_t ──► SSM ──► z_t+1_pred
-  │  (from Level N-1)                       │       ▲              │
-  │                                         │       │              │
-  │  z_delta ───────────────────────────────┘       a_t            │
-  │  (prediction error, sent upward)         (from above)          │
-  │                                                                ▼
-  └── z_t+1_pred ──────────────────────────────────► sent downward
-      saved as z_t_pred for next step
-
-──────────────────────────────────────────────
-Objective injection (top-down task signal)
-──────────────────────────────────────────────
-
-When objective_enabled is True the level accepts an external task_target.
-Two mechanisms work together:
-
-  A. Top-down injection (forward — immediate behavioural shift)
-       target_encoder(y) → z_obj  (scalar target → d_repr vector)
-       epsilon_obj = z_t - z_obj
-       z_t += alpha_obj * tanh · obj_correction(epsilon_obj)
-
-  B. Translator + task loss (backward — permanent SSM learning)
-       x* = translator(z_t)                (z_t → observable)
-       loss_ae  = MSE(x*, x_actual)        (keep decoder faithful)
-       loss_task = MSE(x*, task_target)    (shape SSM toward target)
-
-──────────────────────────────────────────────
-SIGReg
-──────────────────────────────────────────────
-
-SIGReg prevents representational collapse of the encoder output z_t
-by regularizing the covariance matrix of the online representations.
 """
 
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -66,7 +14,20 @@ from .sigreg import SIGReg
 from .ssm import SelectiveSSM
 
 
+@dataclass
+class PCLevelOutput:
+    """Structured container for single-step and sequence outputs."""
+    z_t: torch.Tensor                       # Encoder output: representation at current step (B, d_repr) or (B, T, d_repr)
+    z_next_pred: torch.Tensor               # SSM output: predicted representation for next step
+    ssm_h: torch.Tensor                     # Updated SSM hidden state (B, d_state)
+    z_delta: Optional[torch.Tensor] = None  # Prediction error: z_t - z_t_pred
+    x_pred: Optional[torch.Tensor] = None   # Translator/Task prediction output
+
 class PCLevel(nn.Module):
+    """
+    Predictive Coding (PC) Level module with FNN Encoder, 
+    Selective SSM dynamics predictor, and optional task head.
+    """
     def __init__(
         self,
         d_below: int,
@@ -76,230 +37,174 @@ class PCLevel(nn.Module):
         super().__init__()
 
         self.d_below = d_below
-        self.d_repr = config.d_representation
         self.d_above = d_above
+        self.d_repr = config.d_representation
         self.objective_enabled = config.objective_enabled
 
-        # Encoder: signal from below → representation z_t
+        # Encoder: Maps input from level below to representation space
         self.encoder = FNN(
             input_dim=d_below,
-            output_dim=config.d_representation,
+            output_dim=self.d_repr,
             hidden_dims=config.encoder_hidden,
         )
 
-        # SSM: predicts next z_t from (z_t, a_t)
-        ssm_input_dim = config.d_representation + (d_above or 0)
+        # Predictive SSM: Maps (z_t, signal_above) to z_{t+1} prediction
+        ssm_input_dim = self.d_repr + (d_above if d_above is not None else 0)
         self.ssm = SelectiveSSM(
             d_input=ssm_input_dim,
-            d_output=config.d_representation,
+            d_output=self.d_repr,
             config=config.ssm,
         )
 
-        # SIGReg: regularize encoder output z_t
-        self.sigreg = SIGReg(
-            d_repr=config.d_representation,
-            online_tau=config.sigreg_tau,
-            var_threshold=config.sigreg_var_threshold,
-        )
-
-        # ------------------------------------------------------------------
-        # Objective injection — top-down task signal
-        # ------------------------------------------------------------------
+        # Optional Objective / Task Translator Head
         if self.objective_enabled:
-            self.target_encoder = FNN(1, config.d_representation, [])
-            self.obj_correction = FNN(
-                config.d_representation, config.d_representation, []
+            self.translator = FNN(
+                input_dim=self.d_repr,
+                output_dim=1,
+                hidden_dims=config.translator_hidden
             )
-            self.alpha_obj = nn.Parameter(torch.zeros(1))
-            self.translator = FNN(config.d_representation, 1, config.translator_hidden)
-            self._ae_weight = config.objective_ae_weight
-            self._task_weight = config.objective_task_weight
         else:
-            self.target_encoder = None
-            self.obj_correction = None
-            self.alpha_obj = None
             self.translator = None
-            self._ae_weight = 0.0
-            self._task_weight = 0.0
-
-    # -----------------------------------------------------------------------
-    # Hidden state
-    # -----------------------------------------------------------------------
 
     def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Helper to initialize zero-state for SSM."""
         return self.ssm.init_hidden(batch_size, device)
 
-    # -----------------------------------------------------------------------
-    # Core forward interfaces
-    # -----------------------------------------------------------------------
+    def _prepare_ssm_input(
+        self, 
+        z_t: torch.Tensor, 
+        signal_above: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Concatenates current latent state with top-down feedback if present."""
+        if self.d_above is None:
+            return z_t
+
+        if signal_above is None:
+            signal_above = torch.zeros(
+                z_t.shape[0], self.d_above, device=z_t.device, dtype=z_t.dtype
+            )
+        return torch.cat([z_t, signal_above], dim=-1)
 
     def step(
         self,
-        signal_from_below: torch.Tensor,
-        h: torch.Tensor,
-        a_t: Optional[torch.Tensor] = None,
+        signal_below: torch.Tensor,
+        h_prev: torch.Tensor,
+        signal_above: Optional[torch.Tensor] = None,
         z_t_pred: Optional[torch.Tensor] = None,
-        task_target: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-    ]:
+    ) -> PCLevelOutput:
         """
-        Process a single timestep.
-
-        Args:
-            signal_from_below: Raw signal from the level below (or encoded obs
-                               for Level 0) at time t.
-            h:                 SSM hidden state from t-1.
-            a_t:               Top-down prediction from level above
-                               (SSM output z_t+1_pred of above level).
-                               None if this is the top level.
-            z_t_pred:          SSM prediction from the PREVIOUS timestep
-                               (saved z_t+1_pred from t-1). Used to compute
-                               the prediction error z_delta.
-                               None on the very first step (treated as zeros).
-            task_target:       Target value for objective (B, 1) or None.
-                               Only used when objective_enabled=True.
-
-        Returns:
-            z_t:           Encoder output (B, d_repr) — upward signal.
-            z_next_pred:   SSM prediction (B, d_repr) — downward signal,
-                           saved as z_t_pred for the next step.
-            h_new:         Updated SSM hidden state (B, d_state).
-            z_delta:       Prediction error (B, d_repr):
-                           z_t - z_t_pred. Used for training.
-            x_star:        Translator output (B, 1) or None if not enabled.
+        Processes a single timestep (Online/Recurrent Execution Mode).
         """
-        # 1. Encode signal from below
-        z_t = self.encoder(signal_from_below)
+        # 1. Encode bottom-up signal
+        z_t = self.encoder(signal_below)
 
-        self.sigreg.update_online(z_t.detach().squeeze(0))
+        # 2. Compute prediction error if previous prediction is supplied
+        z_delta = (z_t - z_t_pred) if z_t_pred is not None else None
 
-        # 2. Objective top-down injection (modifies z_t)
-        if task_target is not None and self.objective_enabled:
-            target_encoder = self.target_encoder
-            obj_correction = self.obj_correction
-            alpha_obj = self.alpha_obj
-            assert target_encoder is not None
-            assert obj_correction is not None
-            assert alpha_obj is not None
-            z_obj = target_encoder(task_target)
-            epsilon_obj = z_t - z_obj
-            correction_obj = obj_correction(epsilon_obj)
-            z_t = z_t + torch.tanh(alpha_obj) * correction_obj
+        # 3. Step the SSM forward dynamics
+        ssm_input = self._prepare_ssm_input(z_t, signal_above)
+        z_next_pred, h_new = self.ssm.step(ssm_input, h_prev)
 
-        # 3. Build SSM input: concat(z_t, a_t)
-        if self.d_above is not None:
-            if a_t is not None:
-                ssm_input = torch.cat([z_t, a_t], dim=-1)
-            else:
-                a_t_zeros = torch.zeros(
-                    z_t.shape[0], self.d_above, device=z_t.device, dtype=z_t.dtype
-                )
-                ssm_input = torch.cat([z_t, a_t_zeros], dim=-1)
-        else:
-            ssm_input = z_t
+        # 4. Optional task prediction output
+        x_pred = self.translator(z_t) if self.translator is not None else None
 
-        # 4. SSM predicts next representation
-        z_next_pred, h_new = self.ssm.step(ssm_input, h)
-
-        # 5. Compute prediction error
-        if z_t_pred is not None:
-            z_delta = z_t - z_t_pred
-        else:
-            z_delta = torch.zeros_like(z_t)
-
-        # 6. Translator output
-        if self.objective_enabled:
-            translator = self.translator
-            assert translator is not None
-            x_star = translator(z_t)
-        else:
-            x_star = None
-
-        return (z_t, z_next_pred, h_new, z_delta, x_star)
+        return PCLevelOutput(
+            z_t=z_t,
+            z_next_pred=z_next_pred,
+            ssm_h=h_new,
+            z_delta=z_delta,
+            x_pred=x_pred,
+        )
 
     def forward(
         self,
         signal_seq: torch.Tensor,
         h0: Optional[torch.Tensor] = None,
-        a_seq: Optional[torch.Tensor] = None,
+        signal_above_seq: Optional[torch.Tensor] = None,
         z_t_pred_init: Optional[torch.Tensor] = None,
-        task_target: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-    ]:
+    ) -> PCLevelOutput:
         """
-        Process a full sequence — used for upper-level accumulation
-        or batch processing.
-
-        Returns:
-            z_seq:           (B, T, d_repr) encoder outputs.
-            z_next_pred_seq: (B, T, d_repr) SSM predictions.
-            h_final:         (B, d_state) final SSM hidden state.
-            z_delta_seq:     (B, T, d_repr) prediction errors.
-            sigreg_loss:     Scalar SIGReg regularization loss.
-            x_star_seq:      (B, T, 1) or None, translator outputs.
+        Processes a sequence of timesteps (Batch / Sequence Mode).
+        Inputs shape: (Batch, Seq_Len, Dim)
         """
         batch_size, seq_len, _ = signal_seq.shape
         device = signal_seq.device
 
         h = h0 if h0 is not None else self.init_hidden(batch_size, device)
-
-        z_t_pred = (
-            z_t_pred_init
-            if z_t_pred_init is not None
-            else torch.zeros(batch_size, self.d_repr, device=device)
-        )
+        z_t_pred = z_t_pred_init
 
         z_list, z_next_pred_list, z_delta_list, x_list = [], [], [], []
 
         for t in range(seq_len):
-            a_t = (
-                a_seq[:, t] if a_seq is not None and self.d_above is not None else None
+            sig_below_t = signal_seq[:, t]
+            sig_above_t = signal_above_seq[:, t] if signal_above_seq is not None else None
+
+            out = self.step(
+                signal_below=sig_below_t,
+                h_prev=h,
+                signal_above=sig_above_t,
+                z_t_pred=z_t_pred,
             )
 
-            z_t, z_next_pred, h, z_delta, x_star = self.step(
-                signal_seq[:, t], h, a_t, z_t_pred, task_target
-            )
+            z_list.append(out.z_t)
+            z_next_pred_list.append(out.z_next_pred)
+            if out.z_delta is not None:
+                z_delta_list.append(out.z_delta)
+            if out.x_pred is not None:
+                x_list.append(out.x_pred)
 
-            z_list.append(z_t)
-            z_next_pred_list.append(z_next_pred)
-            z_delta_list.append(z_delta)
-            if x_star is not None:
-                x_list.append(x_star)
+            # Update loop variables
+            h = out.ssm_h
+            z_t_pred = out.z_next_pred.detach()  # Detach prediction to isolate graphs
 
-            z_t_pred = z_next_pred.detach()
-
-        z_seq = torch.stack(z_list, dim=1)
-
-        x_star_seq = torch.stack(x_list, dim=1) if x_list else None
-
-        return (
-            z_seq,
-            torch.stack(z_next_pred_list, dim=1),
-            h,
-            torch.stack(z_delta_list, dim=1),
-            self.sigreg.batch_loss(z_seq),
-            x_star_seq,
+        return PCLevelOutput(
+            z_t=torch.stack(z_list, dim=1),
+            z_next_pred=torch.stack(z_next_pred_list, dim=1),
+            ssm_h=h,
+            z_delta=torch.stack(z_delta_list, dim=1) if z_delta_list else None,
+            x_pred=torch.stack(x_list, dim=1) if x_list else None,
         )
 
-    # -----------------------------------------------------------------------
-    # Utility
-    # -----------------------------------------------------------------------
 
-    @property
-    def ae_weight(self) -> float:
-        return self._ae_weight
+# NOT USED. FOR REFERENCE ONLY
+class PCLevelCriterion(nn.Module):
+    """External Loss / Objective Evaluator for PCLevel."""
+    def __init__(self, config: PCLevelConfig):
+        super().__init__()
+        self.sigreg = SIGReg(
+            d_repr=config.d_representation,
+            online_tau=config.sigreg_tau,
+            var_threshold=config.sigreg_var_threshold,
+        )
+        self.translate_weight = config.objective_ae_weight if config.objective_enabled else 0.0
+        self.task_weight = config.objective_task_weight if config.objective_enabled else 0.0
 
-    @property
-    def task_weight(self) -> float:
-        return self._task_weight
+    def forward(
+        self, 
+        outputs: PCLevelOutput, 
+        task_target: Optional[torch.Tensor] = None,
+        task_actual: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        
+        # Update SIGReg statistics during training steps
+        if self.training:
+            self.sigreg.update_online(outputs.z_t.detach())
+
+        # Representation loss (SIGReg)
+        loss_sigreg = self.sigreg(outputs.z_t)
+
+        # Optional task loss
+        loss_task = torch.tensor(0.0, device=outputs.z_t.device)
+        loss_translate = torch.tensor(0.0, device=outputs.z_t.device)
+        if outputs.x_pred is not None and task_target is not None and task_actual is not None:
+            loss_task = nn.functional.mse_loss(outputs.x_pred, task_target)
+            loss_translate = nn.functional.mse_loss(outputs.x_pred, task_actual)
+
+        total_loss = loss_sigreg + (self.task_weight * loss_task) + (self.translate_weight * loss_translate)
+
+        return {
+            "loss_total": total_loss,
+            "loss_sigreg": loss_sigreg,
+            "loss_task": loss_task,
+            "loss_translate": loss_translate,
+        }

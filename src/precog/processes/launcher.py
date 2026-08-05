@@ -233,6 +233,12 @@ class Launcher:
         with open(ENV_CONFIG_PATH) as f:
             env_cfg = yaml.safe_load(f)
         env_shapes = _env_shapes_from_yaml(env_cfg)
+
+        raw_level_devices = env_cfg.get("level_devices", {})
+        self._level_devices: Dict[int, str] = {
+            int(k): str(v) for k, v in raw_level_devices.items()
+        }
+
         return resolve_config_dims(DEFAULT_CONFIG, env_shapes)
 
     def _auto_frequencies(self) -> List[float]:
@@ -365,7 +371,7 @@ class Launcher:
                 "upward_writer": upward_writer,
                 "downward_reader": downward_reader,
                 "downward_writer": downward_writer,
-                "device": self._device,
+                "device": self._level_devices.get(i, self._device),
             }
 
             self._level_kwargs.append(kwargs)

@@ -147,6 +147,13 @@ actions:
     msg_type: std_msgs/msg/Float32
     codec: float
 
+# Per-level device assignment. Overrides the global --device CLI flag.
+# Key = level index, value = "cpu" or "cuda".
+level_devices:
+  0: cuda
+  1: cuda
+  2: cuda
+
 # External "expert" actions
 expert_action_observations:
   - key: expert_steering

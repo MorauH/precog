@@ -2,11 +2,11 @@
 Generic upper-level process (L1, L2, ... Ln).
 
 Each upper-level process:
-  1. Reads the level below's prediction error (z_delta) from an upward ShmTensorSlot.
+  1. Reads the level below's representation (z_below) from an upward ShmTensorSlot.
   2. Receives top-down predictions from the level above via a downward ShmTensorSlot.
   3. Accumulates signal_below values into sequences.
-  4. On its own tick cadence, runs the SSM forward pass.
-  5. Sends its prediction error (z_delta) upward and its prediction (z_next_pred) downward.
+  4. On its own tick cadence, runs the predictor forward pass.
+  5. Sends its representation (z_t) upward and its prediction (z_next_pred) downward.
   6. Does online learning (forward-only, backward on its own tick).
 
 Never calls backward() from a separate learner.
@@ -33,8 +33,6 @@ def run_level_n(
     stop_event: multiprocessing.Event,
     level_idx: int,
     config: PCLevelConfig,
-    d_below: int,
-    d_above: Optional[int],
     *,
     clock: LevelClock,
     frequency: float = 0.0,
@@ -54,9 +52,7 @@ def run_level_n(
     Args:
         stop_event: Set by launcher to request clean shutdown.
         level_idx: Index of this level in the hierarchy.
-        config: PCLevelConfig for this level.
-        d_below: Dimension of the level below's representation.
-        d_above: Dimension of the level above's representation (None if top).
+        config: PCLevelConfig for this level (includes d_below, d_above).
         frequency: Tick rate in Hz for this level.
         upward_reader: Reads z_below from the level below.
         upward_writer: Writes z_t upward to the level above.
@@ -72,9 +68,10 @@ def run_level_n(
     """
     dev = torch.device(device)
 
+    assert config.d_below is not None, "d_below must be resolved"
     level = PCLevel(
-        d_below=d_below,
-        d_above=d_above,
+        d_below=config.d_below,
+        d_above=config.d_above,
         config=config,
     ).to(dev)
     level.train()
@@ -93,7 +90,6 @@ def run_level_n(
     ).to(dev)
 
     batch_size = 1
-    h_state = level.init_hidden(batch_size, dev)
     prev_z_pred: Optional[torch.Tensor] = None
     last_signal_above: Optional[torch.Tensor] = (
         None  # Hold value as this updates slower
@@ -166,8 +162,6 @@ def run_level_n(
         if config.objective_enabled and obj_key:
             task_target = torch.full((batch_size, 1), obj_target, device=dev)
 
-        h_in = h_state.detach()
-
         optimizer.zero_grad()
 
         # ----- Forward pass
@@ -175,29 +169,25 @@ def run_level_n(
             # Single step
             out: PCLevelOutput = level.step(
                 signal_below=seq_below[:, 0],
-                h_prev=h_in,
                 signal_above=seq_above[:, 0] if seq_above is not None else None,
                 z_t_pred=prev_z_pred.detach() if prev_z_pred is not None else None,
             )
             z_t = out.z_t
             z_next_pred = out.z_next_pred
-            h_new = out.ssm_h
             x_pred = out.x_pred
             x_curr = out.x_curr
-            z_delta_up = out.z_delta
 
-            # Prediction loss — SSM output vs current encoder output.
+            # Prediction loss — predictor output vs current encoder output.
             # Both in the same forward graph → no stale-parameter issue.
             # z_t is detached as target so the encoder doesn't get a trivial
-            # "match yourself" gradient; the encoder signal comes from the SSM
-            # path (z_t is attached in ssm_input) + loss_translate + sigreg.
+            # "match yourself" gradient; the encoder signal comes from the predictor
+            # path (z_t is attached in pred_input) + loss_translate + sigreg.
             loss_pred = F.mse_loss(z_next_pred, z_t.detach())
 
         else:
             # Multi-step sequence mode
             out: PCLevelOutput = level.forward(
                 signal_below_seq=seq_below,
-                h0=h_in,
                 signal_above_seq=seq_above,
                 z_t_pred_init=prev_z_pred.detach() if prev_z_pred is not None else None,
             )
@@ -206,10 +196,8 @@ def run_level_n(
 
             z_t = z_t_seq[:, -1]
             z_next_pred = z_next_pred_seq[:, -1]
-            h_new = out.ssm_h
             x_pred = out.x_pred[:, -1] if out.x_pred else None
             x_curr = out.x_curr[:, -1] if out.x_curr else None
-            z_delta_up = out.z_delta[:, -1] if out.z_delta is not None else None
 
             # Prediction loss — all within a single forward graph, so gradients flow
             loss_pred = torch.tensor(0.0, device=dev)
@@ -225,7 +213,7 @@ def run_level_n(
         loss_sigreg = sigreg_loss_fn.compute_loss_online()
 
         # Optional task losses
-        #   loss_task      = MSE(x_pred, task_target)  — SSM's predicted x vs target → flows through SSM
+        #   loss_task      = MSE(x_pred, task_target)  — predictor's predicted x vs target → flows through predictor
         #   loss_translate = MSE(x_curr, task_actual)   — encoder readout vs actual   → flows through translator only
         loss_task = torch.tensor(0.0, device=dev)
         loss_translate = torch.tensor(0.0, device=dev)
@@ -255,14 +243,12 @@ def run_level_n(
 
         # ----- Publish outputs
         if upward_writer is not None:
-            upward_signal = z_delta_up if z_delta_up is not None else z_t
-            upward_writer.write(upward_signal)
+            upward_writer.write(z_t)
 
         if downward_writer is not None:
             downward_writer.write(z_next_pred)
 
         # ----- State update
-        h_state = h_new.detach()
         prev_z_pred = z_next_pred.detach()
 
         accumulated_below.clear()

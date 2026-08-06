@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
-
-
-@dataclass
-class SSMConfig:
-    d_state: int
-    dt_min: float = 0.001
-    dt_max: float = 0.1
+from typing import Dict, List, Optional
 
 
 @dataclass
 class PCLevelConfig:
     d_representation: int
-    ssm: SSMConfig
+    d_below: Optional[int] = None
+    d_above: Optional[int] = None
+    predictor_hidden: List[int] = field(default_factory=lambda: [64])
     encoder_hidden: List[int] = field(default_factory=lambda: [64])
     sigreg_tau: float = 0.999
     sigreg_var_threshold: float = 0.1
@@ -80,11 +75,32 @@ def resolve_config_dims(
 
     d_input += config.control_dim
 
+    num_levels = len(config.level_configs)
+    level_configs = list(config.level_configs)
+    for i, lvl_cfg in enumerate(level_configs):
+        d_below = d_input if i == 0 else level_configs[i - 1].d_representation
+        d_above = level_configs[i + 1].d_representation if i + 1 < num_levels else None
+        level_configs[i] = PCLevelConfig(
+            d_representation=lvl_cfg.d_representation,
+            d_below=d_below,
+            d_above=d_above,
+            predictor_hidden=lvl_cfg.predictor_hidden,
+            encoder_hidden=lvl_cfg.encoder_hidden,
+            sigreg_tau=lvl_cfg.sigreg_tau,
+            sigreg_var_threshold=lvl_cfg.sigreg_var_threshold,
+            objective_enabled=lvl_cfg.objective_enabled,
+            objective_observable_key=lvl_cfg.objective_observable_key,
+            objective_target_value=lvl_cfg.objective_target_value,
+            objective_ae_weight=lvl_cfg.objective_ae_weight,
+            objective_task_weight=lvl_cfg.objective_task_weight,
+            translator_hidden=lvl_cfg.translator_hidden,
+        )
+
     return ModelConfig(
         observation_keys=config.observation_keys,
         control_dim=config.control_dim,
         d_input=d_input,
-        level_configs=config.level_configs,
+        level_configs=level_configs,
         control_head=config.control_head,
         control_level_idx=config.control_level_idx,
         imitation_loss_weight=config.imitation_loss_weight,
@@ -108,7 +124,6 @@ DEFAULT_CONFIG = ModelConfig(
     level_configs=[
         PCLevelConfig(
             d_representation=32,
-            ssm=SSMConfig(d_state=16, dt_min=0.001, dt_max=0.01),
             objective_enabled=True,
             objective_observable_key="forward_speed",
             objective_target_value=0.25,
@@ -117,7 +132,6 @@ DEFAULT_CONFIG = ModelConfig(
         ),
         PCLevelConfig(
             d_representation=32,
-            ssm=SSMConfig(d_state=16, dt_min=0.01, dt_max=0.1),
             objective_enabled=True,
             objective_observable_key="lateral_deviation",
             objective_target_value=0.0,
@@ -126,7 +140,6 @@ DEFAULT_CONFIG = ModelConfig(
         ),
         PCLevelConfig(
             d_representation=64,
-            ssm=SSMConfig(d_state=32, dt_min=0.1, dt_max=1.0),
             objective_enabled=False,
         ),
     ],

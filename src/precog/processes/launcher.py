@@ -106,8 +106,6 @@ def _worker_level_n(
     stop_event,
     level_idx,
     config_dict,
-    d_below,
-    d_above,
     frequency,
     beat_name,
     num_levels,
@@ -124,7 +122,7 @@ def _worker_level_n(
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     from precog.processes.level_n import run_level_n
-    from precog.model.config import PCLevelConfig, SSMConfig
+    from precog.model.config import PCLevelConfig
     from precog.messaging.clock import ShmBeat
     from precog.model.hierarchical_clock import LevelClock
 
@@ -132,16 +130,12 @@ def _worker_level_n(
     divisor = round(base_frequency / frequency)
     clock = LevelClock.reader(beat, divisor=divisor, level_idx=level_idx)
 
-    cfg_dict_clean = config_dict.copy()
-    ssm_dict = cfg_dict_clean.pop("ssm", {})
-    cfg = PCLevelConfig(ssm=SSMConfig(**ssm_dict), **cfg_dict_clean)
+    cfg = PCLevelConfig(**config_dict)
 
     kwargs: Dict[str, Any] = {
         "stop_event": stop_event,
         "level_idx": level_idx,
         "config": cfg,
-        "d_below": d_below,
-        "d_above": d_above,
         "clock": clock,
         "frequency": frequency,
         "device": device,
@@ -319,17 +313,6 @@ class Launcher:
         for i in range(0, self._num_levels):
             lvl_cfg = config.level_configs[i]
 
-            d_below = (
-                config.d_input
-                if i == 0
-                else config.level_configs[i - 1].d_representation
-            )
-            d_above = (
-                config.level_configs[i + 1].d_representation
-                if i + 1 < self._num_levels
-                else None
-            )
-
             upward_reader = (
                 self._upward_slots[i].name,
                 self._upward_slots[i].shape,
@@ -364,11 +347,7 @@ class Launcher:
 
             cfg_dict = {
                 "d_representation": lvl_cfg.d_representation,
-                "ssm": {
-                    "d_state": lvl_cfg.ssm.d_state,
-                    "dt_min": lvl_cfg.ssm.dt_min,
-                    "dt_max": lvl_cfg.ssm.dt_max,
-                },
+                "predictor_hidden": lvl_cfg.predictor_hidden,
                 "encoder_hidden": lvl_cfg.encoder_hidden,
                 "sigreg_tau": lvl_cfg.sigreg_tau,
                 "sigreg_var_threshold": lvl_cfg.sigreg_var_threshold,
@@ -392,8 +371,6 @@ class Launcher:
                 "stop_event": self._stop_event,
                 "level_idx": i,
                 "config_dict": cfg_dict,
-                "d_below": d_below,
-                "d_above": d_above,
                 "frequency": freqs[i],
                 "beat_name": "main",
                 "num_levels": self._num_levels,

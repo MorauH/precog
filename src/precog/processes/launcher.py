@@ -43,6 +43,7 @@ def _worker_world(
     rt_priority,
     rt_core,
     env_config_path="",
+    task_actual_writer_proxies=None,
 ):
     """Wrapper that catches exceptions in the world worker."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -66,6 +67,12 @@ def _worker_world(
         else None
     )
 
+    task_actual_writers: dict[int, ShmTensorSlot] = {}
+    if task_actual_writer_proxies is not None:
+        for level_idx_str, proxy in task_actual_writer_proxies.items():
+            level_idx = int(level_idx_str)
+            task_actual_writers[level_idx] = _ShmWriterHandle(*proxy).writer()
+
     try:
         run_world(
             stop_event,
@@ -78,6 +85,7 @@ def _worker_world(
             dashboard_port=dashboard_port,
             rt_priority=rt_priority,
             rt_core=rt_core,
+            task_actual_writers=task_actual_writers,
         )
     except Exception as e:
         print(f"[Launcher] World process crashed: {e}", file=sys.stderr)
@@ -89,6 +97,8 @@ def _worker_world(
             upward_writer.close()
         if downward_reader is not None:
             downward_reader.close()
+        for w in task_actual_writers.values():
+            w.close()
         beat.close()
 
 
@@ -106,6 +116,7 @@ def _worker_level_n(
     upward_writer,
     downward_reader,
     downward_writer,
+    task_actual_reader,
     device,
 ):
     """Wrapper that catches exceptions in an level worker."""
@@ -155,6 +166,10 @@ def _worker_level_n(
     if downward_writer is not None:
         s = _ShmWriterHandle(*downward_writer).writer()
         kwargs["downward_writer"] = s
+        _slots.append(s)
+    if task_actual_reader is not None:
+        s = _ShmReaderHandle(*task_actual_reader).reader()
+        kwargs["task_actual_reader"] = s
         _slots.append(s)
 
     try:
@@ -226,6 +241,7 @@ class Launcher:
 
         self._upward_slots: List[ShmTensorSlot] = []
         self._downward_slots: List[ShmTensorSlot] = []
+        self._task_actual_slots: List[Optional[ShmTensorSlot]] = []
 
         self._config = self._resolve_config()
 
@@ -288,6 +304,14 @@ class Launcher:
 
             slot_down = ShmTensorSlot(f"down_L{i + 1}_to_L{i}", (1, d_repr_upper))
             self._downward_slots.append(slot_down)
+
+        # Slots for task_actual observable values (one per enabled level)
+        for i in range(self._num_levels):
+            if config.level_configs[i].objective_enabled:
+                slot = ShmTensorSlot(f"task_actual_L{i}", (1, 1))
+                self._task_actual_slots.append(slot)
+            else:
+                self._task_actual_slots.append(None)
 
     def _spawn_levels(self, ctx, freqs: List[float]) -> None:
         config = self._config
@@ -356,6 +380,13 @@ class Launcher:
                 "translator_hidden": lvl_cfg.translator_hidden,
             }
 
+            task_slot = self._task_actual_slots[i]
+            task_actual_reader = (
+                (task_slot.name, task_slot.shape, str(task_slot._dtype))
+                if task_slot is not None
+                else None
+            )
+
             base_freq = max(freqs)
             kwargs = {
                 "stop_event": self._stop_event,
@@ -371,6 +402,7 @@ class Launcher:
                 "upward_writer": upward_writer,
                 "downward_reader": downward_reader,
                 "downward_writer": downward_writer,
+                "task_actual_reader": task_actual_reader,
                 "device": self._level_devices.get(i, self._device),
             }
 
@@ -406,6 +438,17 @@ class Launcher:
         )
 
         base_freq = max(self._level_frequencies) if self._level_frequencies else freq
+
+        task_actual_writer_proxies: dict[str, tuple] = {}
+        for i in range(self._num_levels):
+            slot = self._task_actual_slots[i]
+            if slot is not None:
+                task_actual_writer_proxies[str(i)] = (
+                    slot.name,
+                    slot.shape,
+                    str(slot._dtype),
+                )
+
         world_kwargs = {
             "stop_event": self._stop_event,
             "headless": self._headless,
@@ -418,6 +461,7 @@ class Launcher:
             "rt_priority": self._rt_priority,
             "rt_core": self._rt_core,
             "env_config_path": ENV_CONFIG_PATH,
+            "task_actual_writer_proxies": task_actual_writer_proxies,
         }
 
         self._world_process = ctx.Process(
@@ -507,6 +551,9 @@ class Launcher:
             slot.close()
         for slot in self._downward_slots:
             slot.close()
+        for slot in self._task_actual_slots:
+            if slot is not None:
+                slot.close()
 
         if hasattr(self, "_beat"):
             self._beat.close()

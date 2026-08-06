@@ -21,7 +21,8 @@ class PCLevelOutput:
     z_next_pred: torch.Tensor               # SSM output: predicted representation for next step
     ssm_h: torch.Tensor                     # Updated SSM hidden state (B, d_state)
     z_delta: Optional[torch.Tensor] = None  # Prediction error: z_t - z_t_pred
-    x_pred: Optional[torch.Tensor] = None   # Translator/Task prediction output
+    x_pred: Optional[torch.Tensor] = None   # Translator on z_next_pred: predicted x (flows through SSM)
+    x_curr: Optional[torch.Tensor] = None   # Translator on z_t: current x readout (encoder only)
 
 class PCLevel(nn.Module):
     """
@@ -102,11 +103,20 @@ class PCLevel(nn.Module):
         z_delta = (z_t - z_t_pred) if z_t_pred is not None else None
 
         # 3. Step the SSM forward dynamics
+        #    z_t passes through attached so the encoder receives gradients from
+        #    loss_pred (predictability) and loss_task (task shaping) via the SSM.
         ssm_input = self._prepare_ssm_input(z_t, signal_above)
         z_next_pred, h_new = self.ssm.step(ssm_input, h_prev)
 
-        # 4. Optional task prediction output
-        x_pred = self.translator(z_t) if self.translator is not None else None
+        # 4. Optional task prediction outputs
+        #    x_pred  = translator(z_next_pred) — predicted x from SSM → flows through SSM
+        #    x_curr  = translator(z_t)         — current x readout → flows through encoder only
+        if self.translator is not None:
+            x_pred = self.translator(z_next_pred)
+            x_curr = self.translator(z_t)
+        else:
+            x_pred = None
+            x_curr = None
 
         return PCLevelOutput(
             z_t=z_t,
@@ -114,6 +124,7 @@ class PCLevel(nn.Module):
             ssm_h=h_new,
             z_delta=z_delta,
             x_pred=x_pred,
+            x_curr=x_curr,
         )
 
     def forward(
@@ -133,7 +144,9 @@ class PCLevel(nn.Module):
         h = h0 if h0 is not None else self.init_hidden(batch_size, device)
         z_t_pred = z_t_pred_init
 
-        z_list, z_next_pred_list, z_delta_list, x_list = [], [], [], []
+        z_list, z_next_pred_list, z_delta_list, x_pred_list, x_curr_list = (
+            [], [], [], [], []
+        )
 
         for t in range(seq_len):
             sig_below_t = signal_below_seq[:, t]
@@ -151,7 +164,9 @@ class PCLevel(nn.Module):
             if out.z_delta is not None:
                 z_delta_list.append(out.z_delta)
             if out.x_pred is not None:
-                x_list.append(out.x_pred)
+                x_pred_list.append(out.x_pred)
+            if out.x_curr is not None:
+                x_curr_list.append(out.x_curr)
 
             # Update loop variables
             h = out.ssm_h
@@ -162,7 +177,8 @@ class PCLevel(nn.Module):
             z_next_pred=torch.stack(z_next_pred_list, dim=1),
             ssm_h=h,
             z_delta=torch.stack(z_delta_list, dim=1) if z_delta_list else None,
-            x_pred=torch.stack(x_list, dim=1) if x_list else None,
+            x_pred=torch.stack(x_pred_list, dim=1) if x_pred_list else None,
+            x_curr=torch.stack(x_curr_list, dim=1) if x_curr_list else None,
         )
 
 
@@ -193,12 +209,14 @@ class PCLevelCriterion(nn.Module):
         # Representation loss (SIGReg)
         loss_sigreg = self.sigreg(outputs.z_t)
 
-        # Optional task loss
+        # Optional task losses
+        #   loss_task      = MSE(x_pred, task_target)  — SSM's predicted x vs target
+        #   loss_translate = MSE(x_curr, task_actual)   — encoder readout vs actual
         loss_task = torch.tensor(0.0, device=outputs.z_t.device)
         loss_translate = torch.tensor(0.0, device=outputs.z_t.device)
-        if outputs.x_pred is not None and task_target is not None and task_actual is not None:
+        if outputs.x_pred is not None and outputs.x_curr is not None and task_target is not None and task_actual is not None:
             loss_task = nn.functional.mse_loss(outputs.x_pred, task_target)
-            loss_translate = nn.functional.mse_loss(outputs.x_pred, task_actual)
+            loss_translate = nn.functional.mse_loss(outputs.x_curr, task_actual)
 
         total_loss = loss_sigreg + (self.task_weight * loss_task) + (self.translate_weight * loss_translate)
 

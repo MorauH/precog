@@ -68,6 +68,10 @@ class SIGReg(nn.Module):
 
         Returns a scalar loss tensor.  Returns 0.0 if the covariance is
         not yet meaningful (e.g. all-zeros).
+        
+        The covariance loss is normalized by the total variance (trace) so the
+        loss is scale-invariant — it penalises correlation structure regardless
+        of the absolute magnitude of z_t, preventing O(|z|⁴) explosion.
         """
         cov = self._outer - torch.outer(self._mean, self._mean)
         var = cov.diag().clamp(min=0.0)
@@ -76,7 +80,10 @@ class SIGReg(nn.Module):
         D = self.d_repr
         idx = torch.arange(D, device=cov.device)
         mask = idx.unsqueeze(0) != idx.unsqueeze(1)
-        off = cov[mask]
+
+        trace = var.sum() + 1e-8
+        cov_normalized = cov / trace
+        off = cov_normalized[mask]
         cov_loss = off.pow(2).sum() / max(1, int(mask.sum().item()))
 
         return var_loss + cov_loss
@@ -111,7 +118,10 @@ class SIGReg(nn.Module):
 
         idx = torch.arange(D, device=z.device)
         mask = idx.unsqueeze(0) != idx.unsqueeze(1)
-        off = cov[mask]
+
+        trace = var.sum() + 1e-8
+        cov_normalized = cov / trace
+        off = cov_normalized[mask]
         cov_loss = off.pow(2).sum() / max(1, int(mask.sum().item()))
 
         return var_loss + cov_loss

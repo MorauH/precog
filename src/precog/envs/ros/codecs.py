@@ -265,6 +265,7 @@ def _normalize_observations(snapshot: dict) -> dict:
             50.0 if i % 2 == 0 else 10.0 for i in range(18)
         ],
         "lateral_deviation": [10.0],
+        "forward_speed": [20.0],
     }
 
     for key, scales in _SCALES.items():

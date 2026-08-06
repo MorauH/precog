@@ -2,11 +2,11 @@
 Generic upper-level process (L1, L2, ... Ln).
 
 Each upper-level process:
-  1. Reads the level below's representation (z_below) from an upward ShmTensorSlot.
+  1. Reads the level below's prediction error (z_delta) from an upward ShmTensorSlot.
   2. Receives top-down predictions from the level above via a downward ShmTensorSlot.
-  3. Accumulates z_below values into sequences.
+  3. Accumulates signal_below values into sequences.
   4. On its own tick cadence, runs the SSM forward pass.
-  5. Sends its representation upward and its prediction downward.
+  5. Sends its prediction error (z_delta) upward and its prediction (z_next_pred) downward.
   6. Does online learning (forward-only, backward on its own tick).
 
 Never calls backward() from a separate learner.
@@ -177,25 +177,29 @@ def run_level_n(
                 signal_below=seq_below[:, 0],
                 h_prev=h_in,
                 signal_above=seq_above[:, 0] if seq_above is not None else None,
-                z_t_pred=prev_z_pred,
+                z_t_pred=prev_z_pred.detach() if prev_z_pred is not None else None,
             )
             z_t = out.z_t
             z_next_pred = out.z_next_pred
             h_new = out.ssm_h
             x_pred = out.x_pred
+            x_curr = out.x_curr
+            z_delta_up = out.z_delta
 
-            # Prediction loss
-            loss_pred = torch.tensor(0.0, device=dev)
-            if prev_z_pred is not None:
-                loss_pred = F.mse_loss(prev_z_pred, z_t.detach())
+            # Prediction loss — SSM output vs current encoder output.
+            # Both in the same forward graph → no stale-parameter issue.
+            # z_t is detached as target so the encoder doesn't get a trivial
+            # "match yourself" gradient; the encoder signal comes from the SSM
+            # path (z_t is attached in ssm_input) + loss_translate + sigreg.
+            loss_pred = F.mse_loss(z_next_pred, z_t.detach())
 
         else:
             # Multi-step sequence mode
             out: PCLevelOutput = level.forward(
-                signal_seq=seq_below,
+                signal_below_seq=seq_below,
                 h0=h_in,
                 signal_above_seq=seq_above,
-                z_t_pred_init=prev_z_pred,
+                z_t_pred_init=prev_z_pred.detach() if prev_z_pred is not None else None,
             )
             z_t_seq = out.z_t  # (1, T, d_repr)
             z_next_pred_seq = out.z_next_pred  # (1, T, d_repr)
@@ -204,17 +208,15 @@ def run_level_n(
             z_next_pred = z_next_pred_seq[:, -1]
             h_new = out.ssm_h
             x_pred = out.x_pred[:, -1] if out.x_pred else None
+            x_curr = out.x_curr[:, -1] if out.x_curr else None
+            z_delta_up = out.z_delta[:, -1] if out.z_delta is not None else None
 
-            # Prediction loss
+            # Prediction loss — all within a single forward graph, so gradients flow
             loss_pred = torch.tensor(0.0, device=dev)
             if seq_below.shape[1] > 1:
                 preds = z_next_pred_seq[:, :-1]
                 targets = z_t_seq[:, 1:].detach()
                 loss_pred = F.mse_loss(preds, targets)
-
-            if prev_z_pred is not None:
-                # Step t-1 prediction loss
-                loss_pred = loss_pred + F.mse_loss(prev_z_pred, z_t_seq[:, 0].detach())
 
         # ----- Loss calc
 
@@ -222,22 +224,25 @@ def run_level_n(
             sigreg_loss_fn.update_online(z_t.detach())
         loss_sigreg = sigreg_loss_fn.compute_loss_online()
 
-        # Optional task loss
+        # Optional task losses
+        #   loss_task      = MSE(x_pred, task_target)  — SSM's predicted x vs target → flows through SSM
+        #   loss_translate = MSE(x_curr, task_actual)   — encoder readout vs actual   → flows through translator only
         loss_task = torch.tensor(0.0, device=dev)
         loss_translate = torch.tensor(0.0, device=dev)
 
         if (
             config.objective_enabled
             and x_pred is not None
+            and x_curr is not None
             and task_target is not None
             and task_actual is not None
         ):
             loss_task = F.mse_loss(x_pred, task_target)
-            loss_translate = F.mse_loss(x_pred, task_actual)
+            loss_translate = F.mse_loss(x_curr, task_actual)
 
         total_loss = (
             loss_pred
-            + loss_sigreg
+            + (1e-2 * loss_sigreg)
             + (loss_task_weight * loss_task)
             + (loss_translate_weight * loss_translate)
         )
@@ -250,7 +255,8 @@ def run_level_n(
 
         # ----- Publish outputs
         if upward_writer is not None:
-            upward_writer.write(z_t)
+            upward_signal = z_delta_up if z_delta_up is not None else z_t
+            upward_writer.write(upward_signal)
 
         if downward_writer is not None:
             downward_writer.write(z_next_pred)

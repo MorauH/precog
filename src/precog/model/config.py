@@ -100,6 +100,7 @@ DEFAULT_CONFIG = ModelConfig(
     observation_keys=[
         "current_steering",
         "best_path_relative_sampling",
+        "forward_speed",
         # "car_pose",
     ],
     control_dim=2,
@@ -110,7 +111,7 @@ DEFAULT_CONFIG = ModelConfig(
             ssm=SSMConfig(d_state=16, dt_min=0.001, dt_max=0.01),
             objective_enabled=True,
             objective_observable_key="forward_speed",
-            objective_target_value=5.0,
+            objective_target_value=0.25,
             objective_ae_weight=1.0,
             objective_task_weight=0.1,
         ),

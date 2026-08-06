@@ -83,6 +83,7 @@ def run_world(
     dashboard_port: int = 8080,
     rt_priority: int = 50,
     rt_core: Optional[int] = None,
+    task_actual_writers: Optional[dict[int, ShmTensorSlot]] = None,
 ):
     if rt_priority > 0:
         _set_realtime(rt_priority, rt_core)
@@ -221,6 +222,13 @@ def run_world(
             act_dict = action_to_dict(action, action_keys)
 
             obs = env.step(act_dict)
+
+            # ----- Write task_actual observable values for objective levels
+            if task_actual_writers is not None:
+                for level_idx, writer in task_actual_writers.items():
+                    key = config.level_configs[level_idx].objective_observable_key
+                    if key and obs.get(key) is not None:
+                        writer.write(obs[key])
 
             tick_count += 1
 

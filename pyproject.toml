@@ -31,7 +31,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu132"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 # Route the torch package to the correct mirror based on the active extra
